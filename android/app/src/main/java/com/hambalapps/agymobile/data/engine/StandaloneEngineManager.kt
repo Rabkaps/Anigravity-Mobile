@@ -25,11 +25,15 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.nio.file.Files
+import java.security.KeyStore
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
 data class EngineArch(
     val abi: String,
@@ -156,12 +160,17 @@ class StandaloneEngineManager(
             env["LD_PRELOAD"] = lib.absolutePath
         }
 
-        val certFile = File(usrDir, "etc/tls/cert.pem")
-        if (certFile.exists()) {
+        val certFile = ensureCaBundle()
+        if (certFile != null) {
             env["SSL_CERT_FILE"] = certFile.absolutePath
             env["CURL_CA_BUNDLE"] = certFile.absolutePath
             env["GIT_SSL_CAINFO"] = certFile.absolutePath
             env["NODE_EXTRA_CA_CERTS"] = certFile.absolutePath
+        }
+        val certDirs = listOf("/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts")
+            .filter { File(it).isDirectory }
+        if (certDirs.isNotEmpty()) {
+            env["SSL_CERT_DIR"] = certDirs.joinToString(":")
         }
         val gitCore = File(usrDir, "libexec/git-core")
         if (gitCore.exists()) {
@@ -187,6 +196,33 @@ class StandaloneEngineManager(
             env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
         }
         return env
+    }
+
+    private fun ensureCaBundle(): File? {
+        val certFile = File(usrDir, "etc/tls/cert.pem")
+        if (certFile.exists() && certFile.length() > 1024L) {
+            return certFile
+        }
+        return runCatching {
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            tmf.init(null as KeyStore?)
+            val x509Tm = tmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+                ?: return@runCatching null
+            val issuers = x509Tm.acceptedIssuers
+            if (issuers.isEmpty()) return@runCatching null
+
+            val encoder = Base64.getMimeEncoder(64, "\n".toByteArray(Charsets.US_ASCII))
+            val pem = buildString {
+                issuers.forEach { cert ->
+                    append("-----BEGIN CERTIFICATE-----\n")
+                    append(encoder.encodeToString(cert.encoded))
+                    append("\n-----END CERTIFICATE-----\n")
+                }
+            }
+            certFile.parentFile?.mkdirs()
+            certFile.writeText(pem, Charsets.UTF_8)
+            certFile
+        }.getOrNull()
     }
 
     private val localBrowserPort = AtomicInteger(-1)
