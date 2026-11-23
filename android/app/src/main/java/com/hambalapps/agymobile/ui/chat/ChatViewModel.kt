@@ -493,6 +493,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(terminalPendingCommand = null) }
     }
 
+    fun openUrlInBrowser(url: String, force: Boolean = false) {
+        engineManager.openUrlInBrowser(url, force)
+    }
+
     fun retryAcpHandshake() {
         _uiState.update { it.copy(authError = null) }
         initializeAcpSession()

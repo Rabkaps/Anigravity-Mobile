@@ -4,17 +4,21 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -46,11 +50,14 @@ fun TerminalSheet(
     openedForAuth: Boolean = false,
     onConsumedPendingCommand: () -> Unit = {},
     onDoneAuthReconnect: () -> Unit = {},
+    onOpenUrl: (url: String, force: Boolean) -> Unit = { _, _ -> },
     onDismiss: () -> Unit
 ) {
     val output by ptyClient.output.collectAsState()
     val connected by ptyClient.connected.collectAsState()
+    val detectedUrl by ptyClient.detectedUrl.collectAsState()
     var cmdInput by remember { mutableStateOf("") }
+    var autoOpenedUrl by remember { mutableStateOf<String?>(null) }
     val scrollState = rememberScrollState()
 
     LaunchedEffect(connected, pendingCommand) {
@@ -58,6 +65,14 @@ fun TerminalSheet(
             delay(350)
             ptyClient.sendCommand(pendingCommand)
             onConsumedPendingCommand()
+        }
+    }
+
+    LaunchedEffect(detectedUrl, openedForAuth) {
+        val url = detectedUrl
+        if (url != null && url != autoOpenedUrl && (openedForAuth || PtyWebSocketClient.isAuthLikeUrl(url))) {
+            autoOpenedUrl = url
+            onOpenUrl(url, false)
         }
     }
 
@@ -126,6 +141,28 @@ fun TerminalSheet(
                             else ptyClient.sendCommand(payload)
                         },
                         label = { Text(label) }
+                    )
+                }
+            }
+
+            if (detectedUrl != null) {
+                FilledTonalButton(
+                    onClick = { detectedUrl?.let { onOpenUrl(it, true) } },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = M3ExpressiveShape.Full
+                ) {
+                    Icon(
+                        Icons.Rounded.OpenInBrowser,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        if (PtyWebSocketClient.isAuthLikeUrl(detectedUrl.orEmpty())) {
+                            "Open Login URL in Browser"
+                        } else {
+                            "Open Detected URL in Browser"
+                        }
                     )
                 }
             }

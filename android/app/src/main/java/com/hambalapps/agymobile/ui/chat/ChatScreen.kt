@@ -388,6 +388,7 @@ fun ChatScreen(
             openedForAuth = state.openedTerminalForAuth,
             onConsumedPendingCommand = viewModel::clearTerminalPendingCommand,
             onDoneAuthReconnect = viewModel::finishTerminalAuthAndReconnect,
+            onOpenUrl = viewModel::openUrlInBrowser,
             onDismiss = viewModel::closeSheet
         )
         ActiveSheet.SETTINGS -> ConnectionSettingsSheet(

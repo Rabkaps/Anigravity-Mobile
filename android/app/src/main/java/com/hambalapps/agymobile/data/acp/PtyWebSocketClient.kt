@@ -31,6 +31,9 @@ class PtyWebSocketClient(
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
+    private val _detectedUrl = MutableStateFlow<String?>(null)
+    val detectedUrl: StateFlow<String?> = _detectedUrl.asStateFlow()
+
     private var socket: WebSocket? = null
     private var localProc: Process? = null
     private var localWriter: BufferedWriter? = null
@@ -144,6 +147,7 @@ class PtyWebSocketClient(
 
     fun clearOutput() {
         _output.value = ""
+        _detectedUrl.value = null
     }
 
     fun disconnect() {
@@ -154,14 +158,47 @@ class PtyWebSocketClient(
         runCatching { localProc?.destroy() }
         localProc = null
         _connected.value = false
+        _detectedUrl.value = null
     }
 
     private fun appendOutput(chunk: String) {
         val combined = _output.value + chunk
-        _output.value = if (combined.length > 24_000) {
+        val trimmed = if (combined.length > 24_000) {
             combined.takeLast(24_000)
         } else {
             combined
+        }
+        _output.value = trimmed
+        extractLatestUrl(trimmed)?.let { url ->
+            if (_detectedUrl.value != url) {
+                _detectedUrl.value = url
+            }
+        }
+    }
+
+    private fun extractLatestUrl(text: String): String? {
+        val tail = if (text.length > 4_000) text.takeLast(4_000) else text
+        val clean = ANSI_REGEX.replace(tail, "")
+        val matches = URL_REGEX.findAll(clean)
+            .map { it.value.trimEnd('.', ',', ';', ':', '!', '?') }
+            .filter { it.startsWith("http://") || it.startsWith("https://") }
+            .toList()
+        if (matches.isEmpty()) return null
+        return matches.lastOrNull { isAuthLikeUrl(it) } ?: matches.lastOrNull()
+    }
+
+    companion object {
+        private val ANSI_REGEX = Regex("\\u001B\\[[0-9;?]*[A-Za-z]")
+        private val URL_REGEX = Regex("https?://[^\\s)\\]\\}>\"']+")
+
+        fun isAuthLikeUrl(url: String): Boolean {
+            val lower = url.lowercase()
+            return lower.contains("accounts.google.com") ||
+                lower.contains("oauth") ||
+                lower.contains("login") ||
+                lower.contains("auth") ||
+                lower.contains("127.0.0.1") ||
+                lower.contains("localhost")
         }
     }
 }

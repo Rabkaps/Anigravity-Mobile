@@ -1,6 +1,8 @@
 package com.hambalapps.agymobile.data.engine
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Process
 import android.system.Os
@@ -18,9 +20,14 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URLDecoder
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
 
@@ -173,7 +180,141 @@ class StandaloneEngineManager(
             env["AGY_SHIZUKU_PORT"] = shizukuPort.toString()
             ensureRishShim()
         }
+        val browserPort = startLocalBrowserServer()
+        if (browserPort > 0) {
+            env["AGY_BROWSER_PORT"] = browserPort.toString()
+            ensureBrowserShims()
+            env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
+        }
         return env
+    }
+
+    private val localBrowserPort = AtomicInteger(-1)
+    private var localBrowserServer: ServerSocket? = null
+
+    @Volatile
+    private var lastOpenedBrowserUrl: String? = null
+
+    @Volatile
+    private var lastOpenedBrowserAtMs: Long = 0L
+
+    fun openUrlInBrowser(url: String, force: Boolean = false): Boolean {
+        val trimmed = url.trim()
+        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (!force && trimmed == lastOpenedBrowserUrl && (now - lastOpenedBrowserAtMs) < 4_000L) {
+            return true
+        }
+        lastOpenedBrowserUrl = trimmed
+        lastOpenedBrowserAtMs = now
+        return runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(trimmed)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
+
+    @Synchronized
+    fun startLocalBrowserServer(): Int {
+        val existing = localBrowserPort.get()
+        if (existing > 0 && localBrowserServer?.isClosed == false) return existing
+
+        return runCatching {
+            val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+            localBrowserServer = server
+            val port = server.localPort
+            localBrowserPort.set(port)
+            Thread({
+                while (!server.isClosed) {
+                    runCatching {
+                        val sock = server.accept()
+                        Thread({ handleBrowserClient(sock) }, "AgyBrowserReq").start()
+                    }
+                }
+            }, "AgyBrowserBridge").apply {
+                isDaemon = true
+                start()
+            }
+            port
+        }.getOrDefault(-1)
+    }
+
+    private fun handleBrowserClient(socket: Socket) {
+        socket.use { sock ->
+            sock.soTimeout = 10_000
+            val reader = sock.getInputStream().bufferedReader(Charsets.UTF_8)
+            val requestLine = reader.readLine() ?: return
+            var contentLength = 0
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+                if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                    contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+                }
+            }
+            val bodyChars = CharArray(contentLength.coerceIn(0, 32_768))
+            var read = 0
+            while (read < bodyChars.size) {
+                val n = reader.read(bodyChars, read, bodyChars.size - read)
+                if (n <= 0) break
+                read += n
+            }
+            val body = String(bodyChars, 0, read).trim()
+            val url = if (requestLine.startsWith("POST ")) {
+                body
+            } else {
+                val query = requestLine.substringAfter(" ", "").substringBefore(" ").substringAfter("url=", "")
+                URLDecoder.decode(query, "UTF-8")
+            }
+
+            val ok = openUrlInBrowser(url)
+            val msg = if (ok) "ok\n" else "invalid url\n"
+            val bytes = msg.toByteArray(Charsets.UTF_8)
+            val status = if (ok) "HTTP/1.1 200 OK" else "HTTP/1.1 400 Bad Request"
+            val header = "$status\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+            sock.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
+            sock.getOutputStream().write(bytes)
+            sock.getOutputStream().flush()
+        }
+    }
+
+    private fun ensureBrowserShims() {
+        val script = """#!/system/bin/sh
+if [ -z "${'$'}AGY_BROWSER_PORT" ]; then
+  echo "Browser bridge port not configured" >&2
+  exit 1
+fi
+URL="${'$'}1"
+if [ -z "${'$'}URL" ]; then
+  echo "Usage: ${'$'}0 <url>" >&2
+  exit 1
+fi
+CURL_BIN="${'$'}{PREFIX}/bin/curl"
+if [ -x "${'$'}CURL_BIN" ]; then
+  "${'$'}CURL_BIN" -sS -f -X POST --data-binary "${'$'}URL" "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/open" >/dev/null
+  exit ${'$'}?
+fi
+NODE_BIN="${'$'}{PREFIX}/bin/node"
+if [ -x "${'$'}NODE_BIN" ]; then
+  exec "${'$'}NODE_BIN" -e 'const http=require("http");const req=http.request("http://127.0.0.1:"+process.env.AGY_BROWSER_PORT+"/open",{method:"POST"},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1));});req.on("error",()=>process.exit(1));req.end(process.argv[1]);' "${'$'}URL"
+fi
+echo "Neither curl nor node found for browser shim" >&2
+exit 1
+"""
+        listOf("xdg-open", "termux-open-url", "open").forEach { name ->
+            val shimFile = File(usrDir, "bin/$name")
+            runCatching {
+                shimFile.parentFile?.mkdirs()
+                if (!shimFile.exists() || shimFile.readText() != script) {
+                    shimFile.writeText(script)
+                }
+                chmod755(shimFile)
+            }
+        }
     }
 
     private fun ensureRishShim() {
