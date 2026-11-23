@@ -1,0 +1,30 @@
+{
+  "name": "agy-bridge",
+  "version": "1.0.0",
+  "description": "Local/remote ACP bridge daemon and Android Phone Control MCP server for Agy Mobile",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "agy-bridge": "dist/server.js",
+    "android-control-mcp": "dist/mcp/android-control-mcp.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "start:remote": "node dist/server.js --host 0.0.0.0",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.14",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

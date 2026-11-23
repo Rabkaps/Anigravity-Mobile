@@ -1,0 +1,22 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.apk
+*.ap_
+*.aab
+*.dex
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Node / Bridge
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,803 @@
+package com.hambalapps.agymobile.data.engine
+
+import android.content.Context
+import android.os.Build
+import android.os.Process
+import android.system.Os
+import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPInputStream
+import java.util.zip.ZipInputStream
+
+data class EngineArch(
+    val abi: String,
+    val agyManifest: String,
+    val termuxBootstrapArch: String,
+    val isStaticBinary: Boolean
+)
+
+/**
+ * Manages the self-contained on-device Antigravity runtime inside `filesDir/engine/`,
+ * removing any hard dependency on the Termux app across both `arm64-v8a` and `x86_64` (gbOS86).
+ */
+class StandaloneEngineManager(
+    private val context: Context,
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+) {
+    val engineDir: File = File(context.filesDir, "engine")
+    val usrDir: File = File(engineDir, "usr")
+    val homeDir: File = File(engineDir, "home")
+    val tmpDir: File = File(engineDir, "tmp")
+    val workspaceDir: File = File(homeDir, "workspace")
+    val agyBin: File = File(usrDir, "bin/agy")
+    val nodeBin: File = File(usrDir, "bin/node")
+    val npmBin: File = File(usrDir, "bin/npm")
+    val gitBin: File = File(usrDir, "bin/git")
+    val bashBin: File = File(usrDir, "bin/bash")
+    val bridgeDir: File = File(homeDir, ".agy-bridge")
+    val mcpScript: File = File(bridgeDir, "dist/mcp/android-control-mcp.js")
+    val oauthTokenFile: File = File(homeDir, ".gemini/antigravity-cli/antigravity-oauth-token")
+    private val agyVersionFile: File = File(engineDir, "agy.version")
+    private val toolchainMarker: File = File(engineDir, "toolchain.ok")
+
+    fun detectArch(): EngineArch {
+        val abis = Build.SUPPORTED_ABIS.toList()
+        return if (abis.any { it.equals("x86_64", ignoreCase = true) }) {
+            EngineArch(
+                abi = "x86_64",
+                agyManifest = "linux_amd64_musl",
+                termuxBootstrapArch = "x86_64",
+                isStaticBinary = true
+            )
+        } else {
+            EngineArch(
+                abi = "arm64-v8a",
+                agyManifest = "android_arm64",
+                termuxBootstrapArch = "aarch64",
+                isStaticBinary = false
+            )
+        }
+    }
+
+    fun isAgyInstalled(): Boolean = agyBin.exists() && agyBin.length() > 1_000_000L
+
+    fun isToolchainInstalled(): Boolean =
+        toolchainMarker.exists() && bashBin.exists() && nodeBin.exists() && gitBin.exists()
+
+    fun isNodeMcpReady(): Boolean =
+        nodeBin.exists() && mcpScript.exists() && File(bridgeDir, "node_modules").exists()
+
+    fun installedAgyVersion(): String? =
+        if (agyVersionFile.exists()) agyVersionFile.readText().trim().ifBlank { null } else null
+
+    fun ensureBaseDirs() {
+        usrDir.mkdirs()
+        File(usrDir, "bin").mkdirs()
+        File(usrDir, "lib").mkdirs()
+        homeDir.mkdirs()
+        tmpDir.mkdirs()
+        workspaceDir.mkdirs()
+    }
+
+    fun buildLinkerCommand(executable: File, args: List<String> = emptyList()): List<String> {
+        val linker = File("/system/bin/linker64")
+        return if (linker.exists()) {
+            listOf(linker.absolutePath, executable.absolutePath) + args
+        } else {
+            listOf(executable.absolutePath) + args
+        }
+    }
+
+    fun buildAgyCommand(args: List<String> = emptyList()): List<String> {
+        val arch = detectArch()
+        return if (arch.isStaticBinary) {
+            listOf(agyBin.absolutePath) + args
+        } else {
+            buildLinkerCommand(agyBin, args)
+        }
+    }
+
+    fun findTermuxExecLib(): File? {
+        val v2 = File(usrDir, "lib/libtermux-exec-ld-preload.so")
+        if (v2.exists()) return v2
+        val v1 = File(usrDir, "lib/libtermux-exec.so")
+        if (v1.exists()) return v1
+        return null
+    }
+
+    fun buildChildEnvironment(): Map<String, String> {
+        ensureBaseDirs()
+        val env = LinkedHashMap<String, String>()
+        val sysPath = System.getenv("PATH")
+            ?: "/product/bin:/apex/com.android.runtime/bin:/system_ext/bin:/system/bin:/system/xbin"
+        val binDir = File(usrDir, "bin").absolutePath
+        val libDir = File(usrDir, "lib").absolutePath
+
+        env["HOME"] = homeDir.absolutePath
+        env["PREFIX"] = usrDir.absolutePath
+        env["TMPDIR"] = tmpDir.absolutePath
+        env["TERM"] = "xterm-256color"
+        env["PATH"] = "$binDir:$sysPath"
+        env["LD_LIBRARY_PATH"] = libDir
+        env["SHELL"] = if (File("/system/bin/sh").exists()) "/system/bin/sh" else bashBin.absolutePath
+
+        // Termux v2 `termux-exec-ld-preload.so` honors custom prefix + data dir when configured here.
+        env["TERMUX__PREFIX"] = usrDir.absolutePath
+        env["TERMUX_APP__DATA_DIR"] = context.dataDir.absolutePath
+        env["TERMUX_APP__LEGACY_DATA_DIR"] = "/data/data/${context.packageName}"
+        env["TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"] = "enable"
+
+        findTermuxExecLib()?.let { lib ->
+            env["LD_PRELOAD"] = lib.absolutePath
+        }
+
+        val certFile = File(usrDir, "etc/tls/cert.pem")
+        if (certFile.exists()) {
+            env["SSL_CERT_FILE"] = certFile.absolutePath
+            env["CURL_CA_BUNDLE"] = certFile.absolutePath
+            env["GIT_SSL_CAINFO"] = certFile.absolutePath
+            env["NODE_EXTRA_CA_CERTS"] = certFile.absolutePath
+        }
+        val gitCore = File(usrDir, "libexec/git-core")
+        if (gitCore.exists()) {
+            env["GIT_EXEC_PATH"] = gitCore.absolutePath
+        }
+        val gitTemplates = File(usrDir, "share/git-core/templates")
+        if (gitTemplates.exists()) {
+            env["GIT_TEMPLATE_DIR"] = gitTemplates.absolutePath
+        }
+        val termInfo = File(usrDir, "share/terminfo")
+        if (termInfo.exists()) {
+            env["TERMINFO"] = termInfo.absolutePath
+        }
+        return env
+    }
+
+    suspend fun detectPrivilegeLevel(): String = withContext(Dispatchers.IO) {
+        if (runQuickCheck(listOf("su", "-c", "id"), "uid=0")) return@withContext "root"
+        if (runQuickCheck(listOf("rish", "-c", "id"), "uid=2000")) return@withContext "shizuku"
+        "none"
+    }
+
+    private fun runQuickCheck(cmd: List<String>, expectedSubstring: String): Boolean {
+        return runCatching {
+            val proc = ProcessBuilder(cmd).redirectErrorStream(true).start()
+            val out = proc.inputStream.bufferedReader().readText()
+            val code = proc.waitFor()
+            code == 0 && out.contains(expectedSubstring)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Copies existing Antigravity credentials & conversations from Termux if present and readable via `su`,
+     * so rooted users switching to Standalone don't need to sign in again.
+     */
+    suspend fun migrateTermuxCredentialsIfNeeded(): Boolean = withContext(Dispatchers.IO) {
+        ensureBaseDirs()
+        if (oauthTokenFile.exists()) return@withContext true
+
+        val uid = Process.myUid()
+        val dstGemini = File(homeDir, ".gemini/antigravity-cli")
+        val dstConfig = File(homeDir, ".config/antigravity")
+        dstGemini.mkdirs()
+        dstConfig.mkdirs()
+
+        val srcToken = "${TermuxBridgeBootstrap.TERMUX_HOME}/.gemini/antigravity-cli/antigravity-oauth-token"
+        val srcCred = "${TermuxBridgeBootstrap.TERMUX_HOME}/.config/antigravity/credential-user-scope"
+        val dstToken = oauthTokenFile.absolutePath
+        val dstCred = File(dstConfig, "credential-user-scope").absolutePath
+
+        val script = """
+            if [ -f '$srcToken' ]; then
+              cp -f '$srcToken' '$dstToken'
+              chown $uid:$uid '$dstToken'
+              chmod 600 '$dstToken'
+              if [ -f '$srcCred' ]; then
+                cp -f '$srcCred' '$dstCred'
+                chown $uid:$uid '$dstCred'
+                chmod 600 '$dstCred'
+              fi
+              echo MIGRATED
+            fi
+        """.trimIndent()
+
+        for (cmd in listOf(
+            listOf("su", "-t", "0", "-c", script),
+            listOf("su", "-c", script)
+        )) {
+            val res = runCatching {
+                val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+                val out = p.inputStream.bufferedReader().readText()
+                val code = p.waitFor()
+                code == 0 && out.contains("MIGRATED")
+            }.getOrDefault(false)
+            if (res && oauthTokenFile.exists()) {
+                return@withContext true
+            }
+        }
+        false
+    }
+
+    fun extractBundledBridgeAssets() {
+        ensureBaseDirs()
+        copyAssetDir("bridge", bridgeDir)
+    }
+
+    private fun copyAssetDir(assetPath: String, targetDir: File) {
+        val items = context.assets.list(assetPath) ?: return
+        if (items.isEmpty()) {
+            targetDir.parentFile?.mkdirs()
+            context.assets.open(assetPath).use { input ->
+                FileOutputStream(targetDir).use { output -> input.copyTo(output) }
+            }
+            return
+        }
+        targetDir.mkdirs()
+        for (item in items) {
+            copyAssetDir("$assetPath/$item", File(targetDir, item))
+        }
+    }
+
+    suspend fun installOrUpdateAgy(
+        onProgress: (status: String, progress: Float) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            ensureBaseDirs()
+            extractBundledBridgeAssets()
+            val arch = detectArch()
+
+            onProgress("Checking ${arch.agyManifest} release manifest…", 0.05f)
+            val manifestUrl =
+                "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${arch.agyManifest}.json"
+            val manifestReq = Request.Builder().url(manifestUrl).get().build()
+            val manifestJson = httpClient.newCall(manifestReq).execute().use { resp ->
+                if (!resp.isSuccessful) error("Manifest HTTP ${resp.code}")
+                JSONObject(resp.body?.string().orEmpty())
+            }
+
+            val version = manifestJson.optString("version")
+            val url = manifestJson.optString("url")
+            val expectedSha512 = manifestJson.optString("sha512")
+            if (url.isBlank() || expectedSha512.isBlank()) {
+                error("Invalid agy release manifest")
+            }
+
+            if (isAgyInstalled() && installedAgyVersion() == version) {
+                migrateTermuxCredentialsIfNeeded()
+                onProgress("agy $version already up to date", 1.0f)
+                return@runCatching agyBin
+            }
+
+            val archiveFile = File(tmpDir, "agy.tar.gz")
+            onProgress("Downloading agy $version (${arch.abi})…", 0.10f)
+            val actualSha = downloadWithSha512(url, archiveFile) { frac ->
+                onProgress("Downloading agy $version (${(frac * 100).toInt()}%)…", 0.10f + frac * 0.70f)
+            }
+
+            if (!actualSha.equals(expectedSha512, ignoreCase = true)) {
+                archiveFile.delete()
+                error("SHA-512 mismatch for downloaded agy archive")
+            }
+
+            onProgress("Extracting agy binary…", 0.85f)
+            val tmpBin = File(tmpDir, "antigravity.extracted")
+            extractSingleFileFromTarGz(archiveFile, "antigravity", tmpBin)
+            archiveFile.delete()
+
+            if (!tmpBin.exists() || tmpBin.length() < 1_000_000L) {
+                error("Extracted agy binary missing or truncated")
+            }
+
+            agyBin.parentFile?.mkdirs()
+            if (agyBin.exists()) agyBin.delete()
+            if (!tmpBin.renameTo(agyBin)) {
+                tmpBin.copyTo(agyBin, overwrite = true)
+                tmpBin.delete()
+            }
+            chmod755(agyBin)
+            agyVersionFile.writeText(version)
+            migrateTermuxCredentialsIfNeeded()
+
+            onProgress("Standalone agy $version ready (${arch.abi})", 1.0f)
+            agyBin
+        }
+    }
+
+    suspend fun installPortableToolchain(
+        onProgress: (status: String, progress: Float) -> Unit
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            ensureBaseDirs()
+            extractBundledBridgeAssets()
+            val arch = detectArch()
+
+            onProgress("Fetching ${arch.termuxBootstrapArch} Linux runtime metadata…", 0.03f)
+            val relReq = Request.Builder()
+                .url("https://api.github.com/repos/termux/termux-packages/releases/latest")
+                .header("User-Agent", "AgyMobile/1.3.0")
+                .get()
+                .build()
+            val relJson = httpClient.newCall(relReq).execute().use { resp ->
+                if (!resp.isSuccessful) error("Bootstrap release HTTP ${resp.code}")
+                JSONObject(resp.body?.string().orEmpty())
+            }
+
+            val assets = relJson.optJSONArray("assets") ?: JSONArray()
+            val targetAssetName = "bootstrap-${arch.termuxBootstrapArch}.zip"
+            var bootstrapUrl = ""
+            for (i in 0 until assets.length()) {
+                val obj = assets.optJSONObject(i) ?: continue
+                if (obj.optString("name") == targetAssetName) {
+                    bootstrapUrl = obj.optString("browser_download_url")
+                    break
+                }
+            }
+            if (bootstrapUrl.isBlank()) error("Could not find $targetAssetName in latest release")
+
+            val bootstrapZip = File(tmpDir, targetAssetName)
+            downloadToFile(bootstrapUrl, bootstrapZip) { frac ->
+                onProgress(
+                    "Downloading $targetAssetName (${(frac * 100).toInt()}%)…",
+                    0.05f + frac * 0.35f
+                )
+            }
+
+            onProgress("Unpacking portable Linux prefix…", 0.42f)
+            unzipInto(bootstrapZip, usrDir)
+            bootstrapZip.delete()
+            applySymlinksTxt(File(usrDir, "SYMLINKS.txt"), usrDir)
+            makeTreeExecutable(usrDir)
+
+            onProgress("Resolving git & nodejs-lts dependencies…", 0.50f)
+            val repoBase = "https://packages.termux.dev/apt/termux-main"
+            val packagesText = httpClient.newCall(
+                Request.Builder()
+                    .url("$repoBase/dists/stable/main/binary-${arch.termuxBootstrapArch}/Packages")
+                    .header("User-Agent", "AgyMobile/1.3.0")
+                    .get()
+                    .build()
+            ).execute().use { resp ->
+                if (!resp.isSuccessful) error("Termux Packages HTTP ${resp.code}")
+                resp.body?.string().orEmpty()
+            }
+
+            val pkgIndex = parseDebianPackages(packagesText)
+            val installed = parseInstalledDpkgPackages(File(usrDir, "var/lib/dpkg/status"))
+            val toInstall = resolveDebDependencies(listOf("git", "nodejs-lts"), pkgIndex, installed)
+
+            toInstall.forEachIndexed { idx, pkg ->
+                val stepBase = 0.55f + (idx.toFloat() / toInstall.size.coerceAtLeast(1)) * 0.30f
+                onProgress("Installing ${pkg.name} ${pkg.version} (${idx + 1}/${toInstall.size})…", stepBase)
+                val debFile = File(tmpDir, "${pkg.name}.deb")
+                downloadToFile("$repoBase/${pkg.filename}", debFile) { _ -> }
+                extractDebIntoUsr(debFile)
+                debFile.delete()
+            }
+
+            makeTreeExecutable(usrDir)
+            val shFile = File(usrDir, "bin/sh")
+            if (!shFile.exists() && bashBin.exists()) {
+                runCatching { Os.symlink("bash", shFile.absolutePath) }
+            }
+
+            if (nodeBin.exists() && npmBin.exists() && !File(bridgeDir, "node_modules").exists()) {
+                onProgress("Installing android-control-mcp Node dependencies…", 0.90f)
+                installBridgeNodeModules()
+            }
+
+            toolchainMarker.writeText("ok:${arch.abi}\n")
+            onProgress("Portable Linux toolchain (bash, git, node, npm) ready!", 1.0f)
+        }
+    }
+
+    private fun installBridgeNodeModules() {
+        val cmd = buildLinkerCommand(nodeBin, listOf(npmBin.absolutePath, "install", "--omit=dev", "--no-audit", "--no-fund"))
+        val proc = ProcessBuilder(cmd)
+            .directory(bridgeDir)
+            .redirectErrorStream(true)
+            .apply { environment().putAll(buildChildEnvironment()) }
+            .start()
+        val out = proc.inputStream.bufferedReader().readText()
+        val code = proc.waitFor()
+        if (code != 0) {
+            error("npm install failed ($code): ${out.takeLast(500)}")
+        }
+    }
+
+    private fun downloadWithSha512(
+        url: String,
+        dest: File,
+        onProgress: (Float) -> Unit
+    ): String {
+        val req = Request.Builder().url(url).get().build()
+        val digest = MessageDigest.getInstance("SHA-512")
+        httpClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) error("Download HTTP ${resp.code}")
+            val body = resp.body ?: error("Empty response body")
+            val total = body.contentLength()
+            dest.parentFile?.mkdirs()
+            body.byteStream().use { input ->
+                FileOutputStream(dest).use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var readTotal = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        output.write(buf, 0, n)
+                        digest.update(buf, 0, n)
+                        readTotal += n
+                        if (total > 0) {
+                            onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                        }
+                    }
+                }
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun downloadToFile(url: String, dest: File, onProgress: (Float) -> Unit) {
+        val req = Request.Builder().url(url).header("User-Agent", "AgyMobile/1.3.0").get().build()
+        httpClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) error("Download HTTP ${resp.code} for $url")
+            val body = resp.body ?: error("Empty body for $url")
+            val total = body.contentLength()
+            dest.parentFile?.mkdirs()
+            body.byteStream().use { input ->
+                FileOutputStream(dest).use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var readTotal = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        output.write(buf, 0, n)
+                        readTotal += n
+                        if (total > 0) {
+                            onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun extractSingleFileFromTarGz(tarGzFile: File, targetEntryName: String, outFile: File) {
+        outFile.parentFile?.mkdirs()
+        GZIPInputStream(BufferedInputStream(FileInputStream(tarGzFile))).use { tarStream ->
+            val header = ByteArray(512)
+            val copyBuf = ByteArray(64 * 1024)
+            while (true) {
+                if (!readFully(tarStream, header)) break
+                if (header.all { it == 0.toByte() }) break
+
+                val rawName = header.copyOfRange(0, 100)
+                val nameLen = rawName.indexOf(0.toByte()).let { if (it >= 0) it else rawName.size }
+                val name = String(rawName, 0, nameLen, Charsets.UTF_8).trimStart('.', '/')
+                val sizeStr = String(header, 124, 12, Charsets.US_ASCII).trim('\u0000', ' ')
+                val size = sizeStr.toLongOrNull(8) ?: 0L
+
+                if (name == targetEntryName) {
+                    FileOutputStream(outFile).use { out ->
+                        var rem = size
+                        while (rem > 0) {
+                            val chunk = tarStream.read(copyBuf, 0, minOf(copyBuf.size.toLong(), rem).toInt())
+                            if (chunk <= 0) error("Unexpected EOF extracting $targetEntryName")
+                            out.write(copyBuf, 0, chunk)
+                            rem -= chunk
+                        }
+                    }
+                    return
+                } else {
+                    val skipTotal = size + ((512 - (size % 512)) % 512)
+                    skipFully(tarStream, skipTotal)
+                }
+            }
+            error("Entry '$targetEntryName' not found in tar.gz")
+        }
+    }
+
+    private fun readFully(input: InputStream, buf: ByteArray): Boolean {
+        var off = 0
+        while (off < buf.size) {
+            val n = input.read(buf, off, buf.size - off)
+            if (n < 0) return false
+            off += n
+        }
+        return true
+    }
+
+    private fun skipFully(input: InputStream, bytes: Long) {
+        var rem = bytes
+        val scratch = ByteArray(8192)
+        while (rem > 0) {
+            val n = input.read(scratch, 0, minOf(scratch.size.toLong(), rem).toInt())
+            if (n <= 0) break
+            rem -= n
+        }
+    }
+
+    private fun unzipInto(zipFile: File, targetDir: File) {
+        val canonicalTarget = targetDir.canonicalPath
+        ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                val outFile = File(targetDir, entry.name)
+                if (!outFile.canonicalPath.startsWith(canonicalTarget)) continue
+                if (entry.isDirectory) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    if (outFile.exists()) outFile.delete()
+                    FileOutputStream(outFile).use { out ->
+                        while (true) {
+                            val n = zis.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                        }
+                    }
+                }
+                zis.closeEntry()
+            }
+        }
+    }
+
+    private fun applySymlinksTxt(symlinksFile: File, baseDir: File) {
+        if (!symlinksFile.exists()) return
+        val canonicalBase = baseDir.canonicalPath
+        symlinksFile.readLines().forEach { rawLine ->
+            val line = rawLine.trim()
+            if (line.isEmpty()) return@forEach
+            val idx = line.indexOf('←')
+            if (idx <= 0 || idx >= line.lastIndex) return@forEach
+            val target = line.substring(0, idx)
+            val linkRel = line.substring(idx + 1)
+            val linkFile = File(baseDir, linkRel)
+            val parentPath = linkFile.canonicalFile.parentFile?.canonicalPath ?: return@forEach
+            if (!parentPath.startsWith(canonicalBase)) return@forEach
+            linkFile.parentFile?.mkdirs()
+            runCatching { Files.deleteIfExists(linkFile.toPath()) }
+            runCatching { Os.symlink(target, linkFile.absolutePath) }
+        }
+    }
+
+    private fun makeTreeExecutable(usr: File) {
+        listOf(
+            File(usr, "bin"),
+            File(usr, "libexec"),
+            File(usr, "lib/apt/methods")
+        ).forEach { dir ->
+            if (dir.exists()) {
+                dir.walkTopDown().forEach { f ->
+                    if (f.isFile && !Files.isSymbolicLink(f.toPath())) {
+                        chmod755(f)
+                    }
+                }
+            }
+        }
+        val libDir = File(usr, "lib")
+        if (libDir.exists()) {
+            libDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.name.contains(".so") && !Files.isSymbolicLink(f.toPath())) {
+                    chmod755(f)
+                }
+            }
+        }
+    }
+
+    private fun chmod755(file: File) {
+        runCatching { Os.chmod(file.absolutePath, 493) } // 0755 octal
+            .onFailure { file.setExecutable(true, false) }
+    }
+
+    private data class DebPkg(
+        val name: String,
+        val version: String,
+        val filename: String,
+        val depends: List<String>
+    )
+
+    private fun parseDebianPackages(raw: String): Map<String, DebPkg> {
+        val map = HashMap<String, DebPkg>()
+        for (block in raw.split("\n\n")) {
+            var pkg = ""
+            var ver = ""
+            var filename = ""
+            var depsRaw = ""
+            for (line in block.lines()) {
+                when {
+                    line.startsWith("Package:") -> pkg = line.substringAfter(':').trim()
+                    line.startsWith("Version:") -> ver = line.substringAfter(':').trim()
+                    line.startsWith("Filename:") -> filename = line.substringAfter(':').trim()
+                    line.startsWith("Depends:") -> depsRaw = line.substringAfter(':').trim()
+                }
+            }
+            if (pkg.isNotBlank() && filename.isNotBlank()) {
+                val deps = depsRaw.split(",")
+                    .mapNotNull { dep ->
+                        dep.split("|").firstOrNull()
+                            ?.substringBefore("(")
+                            ?.trim()
+                            ?.takeIf { it.isNotBlank() }
+                    }
+                map[pkg] = DebPkg(pkg, ver, filename, deps)
+            }
+        }
+        return map
+    }
+
+    private fun parseInstalledDpkgPackages(statusFile: File): Set<String> {
+        if (!statusFile.exists()) return emptySet()
+        val installed = HashSet<String>()
+        statusFile.forEachLine { line ->
+            if (line.startsWith("Package:")) {
+                installed.add(line.substringAfter(':').trim())
+            }
+        }
+        return installed
+    }
+
+    private fun resolveDebDependencies(
+        roots: List<String>,
+        index: Map<String, DebPkg>,
+        alreadyInstalled: Set<String>
+    ): List<DebPkg> {
+        val visited = HashSet<String>(alreadyInstalled)
+        val result = ArrayList<DebPkg>()
+
+        fun visit(pkgName: String) {
+            if (!visited.add(pkgName)) return
+            val pkg = index[pkgName] ?: return
+            for (dep in pkg.depends) {
+                visit(dep)
+            }
+            result.add(pkg)
+        }
+
+        for (root in roots) {
+            visit(root)
+        }
+        return result
+    }
+
+    private fun extractDebIntoUsr(debFile: File) {
+        val stageDir = File(tmpDir, "deb_stage").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val dataTar = extractArDataTar(debFile, stageDir)
+            ?: error("data.tar.* not found in ${debFile.name}")
+
+        val env = buildChildEnvironment()
+        val decompBin = when {
+            dataTar.name.endsWith(".xz") -> File(usrDir, "bin/xz")
+            dataTar.name.endsWith(".gz") -> File(usrDir, "bin/gzip")
+            dataTar.name.endsWith(".zst") -> File(usrDir, "bin/zstd")
+            dataTar.name.endsWith(".bz2") -> File(usrDir, "bin/bzip2")
+            else -> null
+        }
+
+        val tarBin = File(usrDir, "bin/tar")
+        val extractStage = File(stageDir, "out").apply { mkdirs() }
+
+        if (decompBin != null && decompBin.exists()) {
+            val decompProc = ProcessBuilder(buildLinkerCommand(decompBin, listOf("-dc", dataTar.absolutePath)))
+                .apply { environment().putAll(env) }
+                .start()
+            val tarProc = ProcessBuilder(buildLinkerCommand(tarBin, listOf("-xf", "-", "-C", extractStage.absolutePath)))
+                .redirectErrorStream(true)
+                .apply { environment().putAll(env) }
+                .start()
+
+            val pipeErr = ByteArrayOutputStream()
+            val copier = Thread {
+                runCatching {
+                    decompProc.inputStream.use { inp ->
+                        tarProc.outputStream.use { out -> inp.copyTo(out) }
+                    }
+                }
+            }
+            copier.start()
+            val tarOut = tarProc.inputStream.bufferedReader().readText()
+            copier.join()
+            val dCode = decompProc.waitFor()
+            val tCode = tarProc.waitFor()
+            if (dCode != 0 || tCode != 0) {
+                error("Failed extracting ${debFile.name} ($dCode/$tCode): $tarOut ${pipeErr}")
+            }
+        } else {
+            val tarProc = ProcessBuilder(buildLinkerCommand(tarBin, listOf("-xf", dataTar.absolutePath, "-C", extractStage.absolutePath)))
+                .redirectErrorStream(true)
+                .apply { environment().putAll(env) }
+                .start()
+            val tarOut = tarProc.inputStream.bufferedReader().readText()
+            val tCode = tarProc.waitFor()
+            if (tCode != 0) error("tar failed for ${debFile.name}: $tarOut")
+        }
+
+        val srcUsr = File(extractStage, "data/data/com.termux/files/usr")
+        if (srcUsr.exists()) {
+            mergeTreePreservingSymlinks(srcUsr, usrDir)
+        }
+        stageDir.deleteRecursively()
+    }
+
+    private fun extractArDataTar(debFile: File, outDir: File): File? {
+        BufferedInputStream(FileInputStream(debFile)).use { inp ->
+            val magic = ByteArray(8)
+            if (!readFully(inp, magic) || String(magic, Charsets.US_ASCII) != "!<arch>\n") {
+                error("Invalid .deb ar header: ${debFile.name}")
+            }
+            val hdr = ByteArray(60)
+            val buf = ByteArray(64 * 1024)
+            while (readFully(inp, hdr)) {
+                val rawName = String(hdr, 0, 16, Charsets.US_ASCII).trim().trimEnd('/')
+                val size = String(hdr, 48, 10, Charsets.US_ASCII).trim().toLongOrNull() ?: 0L
+                if (rawName.startsWith("data.tar")) {
+                    val out = File(outDir, rawName)
+                    FileOutputStream(out).use { fos ->
+                        var rem = size
+                        while (rem > 0) {
+                            val n = inp.read(buf, 0, minOf(buf.size.toLong(), rem).toInt())
+                            if (n <= 0) break
+                            fos.write(buf, 0, n)
+                            rem -= n
+                        }
+                    }
+                    return out
+                } else {
+                    skipFully(inp, size)
+                }
+                if (size % 2L == 1L) {
+                    inp.read()
+                }
+            }
+        }
+        return null
+    }
+
+    private fun mergeTreePreservingSymlinks(srcDir: File, dstDir: File) {
+        val srcPath = srcDir.toPath()
+        val dstPath = dstDir.toPath()
+        Files.walk(srcPath).use { stream ->
+            stream.forEach { current ->
+                val rel = srcPath.relativize(current)
+                if (rel.toString().isEmpty()) return@forEach
+                val target = dstPath.resolve(rel)
+                when {
+                    Files.isSymbolicLink(current) -> {
+                        target.parent?.let { Files.createDirectories(it) }
+                        Files.deleteIfExists(target)
+                        val linkTarget = Files.readSymbolicLink(current)
+                        Files.createSymbolicLink(target, linkTarget)
+                    }
+                    Files.isDirectory(current) -> {
+                        Files.createDirectories(target)
+                    }
+                    else -> {
+                        target.parent?.let { Files.createDirectories(it) }
+                        Files.deleteIfExists(target)
+                        Files.move(current, target)
+                    }
+                }
+            }
+        }
+    }
+}
