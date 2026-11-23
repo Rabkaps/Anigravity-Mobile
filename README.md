@@ -1,6 +1,7 @@
 # Agy Mobile (`com.hambalapps.agymobile`)
 
 A native Kotlin + Jetpack Compose **Material 3 Expressive** Android client for **Antigravity CLI (`agy`)**, speaking the official **Agent Client Protocol (`agy acp`)** through a lightweight bridge daemon (`agy-bridge`) with auto-detecting Android device control (`su` → `Shizuku` → `Termux:API`).
+In simple words, this apps installs the offical agy cli on Android's native terminal and acts as a gui wrapper for it.
 
 ## Architecture
 
