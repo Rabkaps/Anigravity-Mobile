@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import android.system.Os
+import com.hambalapps.agymobile.BuildConfig
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -167,13 +168,90 @@ class StandaloneEngineManager(
         if (termInfo.exists()) {
             env["TERMINFO"] = termInfo.absolutePath
         }
+        val shizukuPort = ShizukuBridge.startLocalRishServer()
+        if (shizukuPort > 0) {
+            env["AGY_SHIZUKU_PORT"] = shizukuPort.toString()
+            ensureRishShim()
+        }
         return env
+    }
+
+    private fun ensureRishShim() {
+        val rishFile = File(usrDir, "bin/rish")
+        val script = """#!/system/bin/sh
+if [ -z "${'$'}AGY_SHIZUKU_PORT" ]; then
+  echo "Shizuku bridge port not configured" >&2
+  exit 126
+fi
+if [ "${'$'}1" = "-c" ]; then
+  shift
+  CMD="${'$'}*"
+elif [ "${'$'}#" -gt 0 ]; then
+  CMD="${'$'}*"
+else
+  CMD="${'$'}(cat)"
+fi
+CURL_BIN="${'$'}{PREFIX}/bin/curl"
+if [ -x "${'$'}CURL_BIN" ]; then
+  RESP="${'$'}(printf '%s' "${'$'}CMD" | "${'$'}CURL_BIN" -sS -w '\n%{http_code}' -X POST --data-binary @- "http://127.0.0.1:${'$'}AGY_SHIZUKU_PORT/exec")"
+  CODE="${'$'}(printf '%s\n' "${'$'}RESP" | tail -n 1)"
+  printf '%s\n' "${'$'}RESP" | sed '${'$'}d'
+  [ "${'$'}CODE" = "200" ] && exit 0 || exit 1
+fi
+NODE_BIN="${'$'}{PREFIX}/bin/node"
+if [ -x "${'$'}NODE_BIN" ]; then
+  exec "${'$'}NODE_BIN" -e 'const http=require("http");const req=http.request("http://127.0.0.1:"+process.env.AGY_SHIZUKU_PORT+"/exec",{method:"POST"},res=>{let d="";res.on("data",c=>d+=c);res.on("end",()=>{process.stdout.write(d);process.exit(res.statusCode===200?0:1);});});req.on("error",e=>{console.error(e.message);process.exit(126);});req.end(process.argv[1]);' "${'$'}CMD"
+fi
+echo "Neither curl nor node found for rish shim" >&2
+exit 127
+"""
+        runCatching {
+            rishFile.parentFile?.mkdirs()
+            if (!rishFile.exists() || rishFile.readText() != script) {
+                rishFile.writeText(script)
+            }
+            chmod755(rishFile)
+        }
     }
 
     suspend fun detectPrivilegeLevel(): String = withContext(Dispatchers.IO) {
         if (runQuickCheck(listOf("su", "-c", "id"), "uid=0")) return@withContext "root"
+        if (ShizukuBridge.hasPermission()) {
+            ShizukuBridge.warmUp(context)
+            return@withContext "shizuku"
+        }
         if (runQuickCheck(listOf("rish", "-c", "id"), "uid=2000")) return@withContext "shizuku"
         "none"
+    }
+
+    fun buildDeviceContextPrompt(privilegeLevel: String): String {
+        val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+        val tools = buildList {
+            if (bashBin.exists()) add("bash")
+            if (gitBin.exists()) add("git")
+            if (nodeBin.exists()) add("node")
+            if (npmBin.exists()) add("npm")
+            if (File(usrDir, "bin/curl").exists()) add("curl")
+            if (File(usrDir, "bin/rish").exists()) add("rish")
+        }
+        val privDesc = when (privilegeLevel) {
+            "root" -> "root (`su -c ...`, uid=0)"
+            "shizuku" -> "Shizuku (`rish -c ...`, uid=2000 ADB-level privileges; use `rish -c \"screencap -p ...\"` etc. for privileged Android commands)"
+            else -> if (ShizukuBridge.isBinderAlive()) {
+                "unprivileged app sandbox (Shizuku is running but permission is not granted to Agy Mobile yet)"
+            } else {
+                "unprivileged app sandbox (no root or active Shizuku)"
+            }
+        }
+        return buildString {
+            appendLine("[Agy Mobile Runtime Environment]")
+            appendLine("- App: Agy Mobile (${BuildConfig.VERSION_NAME}) Standalone Engine on Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
+            appendLine("- Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} ($abi)")
+            appendLine("- Privilege backend: $privDesc")
+            appendLine("- Installed CLI tools in PATH: ${if (tools.isEmpty()) "agy only" else tools.joinToString(", ")}")
+            appendLine("- Workspace/HOME: ${homeDir.absolutePath}")
+            appendLine("- Note: `run_command` executes in the app sandbox unless prefixed with `su -c` (root) or `rish -c` (Shizuku).")
+        }.trim()
     }
 
     private fun runQuickCheck(cmd: List<String>, expectedSubstring: String): Boolean {

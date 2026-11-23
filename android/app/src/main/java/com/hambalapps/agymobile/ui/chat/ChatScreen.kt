@@ -318,6 +318,8 @@ fun ChatScreen(
     state.currentPermission?.let { perm ->
         PermissionRequestSheet(
             request = perm,
+            permissionPolicy = state.preferences?.permissionPolicy ?: "request_review",
+            onSelectPolicy = viewModel::setPermissionPolicy,
             onRespond = { optionId -> viewModel.respondPermission(perm, optionId) }
         )
     }
@@ -348,6 +350,8 @@ fun ChatScreen(
             isLoadingQuota = state.isLoadingQuota,
             quotaLookup = state::quotaForModelChoice,
             onRefreshQuota = viewModel::refreshQuota,
+            permissionPolicy = state.preferences?.permissionPolicy ?: "request_review",
+            onSelectPermissionPolicy = viewModel::setPermissionPolicy,
             onSetConfigOption = viewModel::setConfigOption,
             onOpenAuth = { viewModel.openSheet(ActiveSheet.AUTH) },
             onDismiss = viewModel::closeSheet

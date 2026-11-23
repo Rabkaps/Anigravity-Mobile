@@ -186,7 +186,7 @@ class LocalAcpClient(
         val writer = synchronized(writeLock) { stdinWriter }
             ?: throw IllegalStateException("Standalone agy acp is not running")
 
-        val finalParams = maybeInjectAndroidMcp(method, params)
+        val finalParams = maybeInjectSystemPrompt(method, maybeInjectAndroidMcp(method, params))
         val idNum = nextId.getAndIncrement()
         val idKey = idNum.toString()
         val deferred = CompletableDeferred<JsonElement>()
@@ -283,6 +283,31 @@ class LocalAcpClient(
                 existing.forEach { add(it) }
                 add(serverObj)
             })
+        }
+    }
+
+    private suspend fun maybeInjectSystemPrompt(method: String, params: JsonObject): JsonObject {
+        if (method !in setOf("session/new", "session/load", "session/resume")) return params
+        val existingMeta = runCatching { params["_meta"]?.jsonObject }.getOrNull()
+        val existingAgy = runCatching { existingMeta?.get("antigravity")?.jsonObject }.getOrNull()
+        if (existingAgy?.containsKey("systemPrompt") == true) return params
+
+        val privilegeLevel = engineManager.detectPrivilegeLevel()
+        val contextPrompt = engineManager.buildDeviceContextPrompt(privilegeLevel)
+
+        val mergedAgy = buildJsonObject {
+            existingAgy?.forEach { (k, v) -> put(k, v) }
+            put("systemPrompt", buildJsonObject {
+                put("append", contextPrompt)
+            })
+        }
+        val mergedMeta = buildJsonObject {
+            existingMeta?.forEach { (k, v) -> if (k != "antigravity") put(k, v) }
+            put("antigravity", mergedAgy)
+        }
+        return buildJsonObject {
+            params.forEach { (k, v) -> if (k != "_meta") put(k, v) }
+            put("_meta", mergedMeta)
         }
     }
 

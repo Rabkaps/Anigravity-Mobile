@@ -51,7 +51,8 @@ data class AppPreferences(
     val dynamicColor: Boolean,
     val selectedModel: String,
     val selectedEffort: String,
-    val selectedMode: String
+    val selectedMode: String,
+    val permissionPolicy: String = "request_review"
 ) {
     val activeProfile: ConnectionProfile
         get() = profiles.firstOrNull { it.id == activeProfileId } ?: profiles.first()
@@ -68,6 +69,7 @@ class SettingsRepository(private val context: Context) {
         val SELECTED_MODEL = stringPreferencesKey("selected_model")
         val SELECTED_EFFORT = stringPreferencesKey("selected_effort")
         val SELECTED_MODE = stringPreferencesKey("selected_mode")
+        val PERMISSION_POLICY = stringPreferencesKey("permission_policy")
     }
 
     private val standaloneDefaultCwd = "${context.filesDir.absolutePath}/engine/home"
@@ -119,7 +121,8 @@ class SettingsRepository(private val context: Context) {
             dynamicColor = prefs[Keys.DYNAMIC_COLOR] ?: true,
             selectedModel = prefs[Keys.SELECTED_MODEL] ?: "default",
             selectedEffort = prefs[Keys.SELECTED_EFFORT] ?: "medium",
-            selectedMode = prefs[Keys.SELECTED_MODE] ?: "default"
+            selectedMode = prefs[Keys.SELECTED_MODE] ?: "default",
+            permissionPolicy = prefs[Keys.PERMISSION_POLICY] ?: "request_review"
         )
     }
 
@@ -176,5 +179,9 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setSelectedMode(mode: String) {
         context.dataStore.edit { prefs -> prefs[Keys.SELECTED_MODE] = mode }
+    }
+
+    suspend fun setPermissionPolicy(policy: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.PERMISSION_POLICY] = policy }
     }
 }

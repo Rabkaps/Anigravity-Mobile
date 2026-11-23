@@ -3,6 +3,7 @@ package com.hambalapps.agymobile.ui.chat
 import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.hambalapps.agymobile.data.acp.AcpAuthMethod
@@ -18,6 +19,7 @@ import com.hambalapps.agymobile.data.acp.HealthResponse
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
 import com.hambalapps.agymobile.data.engine.LocalAcpClient
 import com.hambalapps.agymobile.data.engine.QuotaClient
+import com.hambalapps.agymobile.data.engine.ShizukuBridge
 import com.hambalapps.agymobile.data.engine.StandaloneEngineManager
 import com.hambalapps.agymobile.data.local.ConnectionProfile
 import com.hambalapps.agymobile.data.local.SettingsRepository
@@ -27,8 +29,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import rikka.shizuku.Shizuku
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -66,7 +70,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var activeAgentMessageId: String? = null
     private var activeUserMessageId: String? = null
 
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+        if (grantResult == PackageManager.PERMISSION_GRANTED) {
+            viewModelScope.launch {
+                ShizukuBridge.warmUp(getApplication())
+                val priv = engineManager.detectPrivilegeLevel()
+                _uiState.update { state ->
+                    state.copy(health = state.health?.copy(privilegeLevel = priv))
+                }
+            }
+        }
+    }
+
+    private val shizukuBinderListener = Shizuku.OnBinderReceivedListener {
+        ShizukuBridge.requestPermissionIfNeeded()
+    }
+
     init {
+        runCatching {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+            Shizuku.addBinderReceivedListenerSticky(shizukuBinderListener)
+        }
+        ShizukuBridge.requestPermissionIfNeeded()
         refreshTermuxStatus()
         refreshStandaloneStatus()
         observePreferences()
@@ -175,8 +200,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         when (event) {
             is AcpClientEvent.SessionUpdate -> handleSessionUpdate(event.event)
             is AcpClientEvent.PermissionRequested -> {
-                _uiState.update {
-                    it.copy(permissionQueue = it.permissionQueue + event.request)
+                val policy = _uiState.value.preferences?.permissionPolicy ?: "request_review"
+                val kindLower = event.request.kind.lowercase()
+                val autoOptionId = event.request.options.firstOrNull {
+                    it.kind == "allow_always" || it.kind == "allow_once" || !it.kind.startsWith("reject")
+                }?.optionId
+                val shouldAutoApprove = when (policy) {
+                    "turbo" -> autoOptionId != null
+                    "auto" -> autoOptionId != null && kindLower in setOf("read", "search", "list", "view", "fetch")
+                    else -> false
+                }
+                if (shouldAutoApprove) {
+                    acpPermissionReply(event.request.rpcId, autoOptionId)
+                } else {
+                    _uiState.update {
+                        it.copy(permissionQueue = it.permissionQueue + event.request)
+                    }
                 }
             }
             is AcpClientEvent.ElicitationRequested -> {
@@ -330,6 +369,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     authError = null,
                     statusBanner = null
                 )
+            }
+            val savedModel = settingsRepo.preferencesFlow.first().selectedModel
+            if (savedModel.isNotBlank() && savedModel != "default") {
+                val modelOpt = parsed.configOptions.firstOrNull {
+                    it.isLegacyModel || it.category == "model" || it.id == "model"
+                }
+                if (modelOpt != null &&
+                    modelOpt.currentValue != savedModel &&
+                    modelOpt.options.any { it.value == savedModel }
+                ) {
+                    setConfigOption(modelOpt.id, savedModel)
+                }
             }
             refreshQuota()
         }
@@ -699,6 +750,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setPermissionPolicy(policy: String) {
+        viewModelScope.launch {
+            settingsRepo.setPermissionPolicy(policy)
+            if (policy == "turbo") {
+                val queued = _uiState.value.permissionQueue
+                if (queued.isNotEmpty()) {
+                    _uiState.update { it.copy(permissionQueue = emptyList()) }
+                    queued.forEach { req ->
+                        val optId = req.options.firstOrNull {
+                            it.kind == "allow_always" || it.kind == "allow_once" || !it.kind.startsWith("reject")
+                        }?.optionId
+                        acpPermissionReply(req.rpcId, optId)
+                    }
+                }
+            }
+        }
+    }
+
     fun setConfigOption(configId: String, value: String) {
         val sessionId = _uiState.value.sessionId ?: return
         val currentOpt = _uiState.value.configOptions.firstOrNull { it.id == configId }
@@ -730,6 +799,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 put("modelId", value)
                             }
                         )
+                        settingsRepo.setSelectedModel(value)
                         _uiState.update { state ->
                             state.copy(
                                 configOptions = state.configOptions.map {
@@ -747,6 +817,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 put("value", value)
                             }
                         )
+                        if (currentOpt?.category == "model" || configId == "model") {
+                            settingsRepo.setSelectedModel(value)
+                        }
                         val updated = AcpParser.parseConfigOptionsArray(resp.jsonObject["configOptions"])
                         _uiState.update { state ->
                             state.copy(
@@ -1531,6 +1604,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        runCatching {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+            Shizuku.removeBinderReceivedListener(shizukuBinderListener)
+        }
         ptyClient.disconnect()
         acpClient.disconnect()
         localAcpClient.disconnect()

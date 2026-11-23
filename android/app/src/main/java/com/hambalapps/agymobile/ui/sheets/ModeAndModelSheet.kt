@@ -55,6 +55,8 @@ fun ModeAndModelSheet(
     isLoadingQuota: Boolean = false,
     quotaLookup: (value: String, name: String) -> ModelQuotaInfo? = { _, _ -> null },
     onRefreshQuota: () -> Unit = {},
+    permissionPolicy: String = "request_review",
+    onSelectPermissionPolicy: (String) -> Unit = {},
     onSetConfigOption: (configId: String, value: String) -> Unit,
     onOpenAuth: () -> Unit,
     onDismiss: () -> Unit
@@ -112,6 +114,37 @@ fun ModeAndModelSheet(
                             .fillMaxWidth()
                             .clip(CircleShape),
                         trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+                    )
+                }
+            }
+
+            // Tool Permission Mode (Request Review / Auto / Turbo)
+            Surface(
+                shape = M3ExpressiveShape.Large,
+                color = MaterialTheme.colorScheme.surfaceContainerLow
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Tool Permission Mode", style = MaterialTheme.typography.titleMedium)
+                    val policyKeys = listOf("request_review", "auto", "turbo")
+                    val policyLabels = listOf("Review", "Auto", "Turbo")
+                    ConnectedButtonGroup(
+                        options = policyLabels,
+                        selectedIndex = policyKeys.indexOf(permissionPolicy).coerceAtLeast(0),
+                        onSelect = { idx -> onSelectPermissionPolicy(policyKeys[idx]) }
+                    )
+                    Text(
+                        text = when (permissionPolicy) {
+                            "turbo" -> "Turbo: auto-approves all tool & command requests."
+                            "auto" -> "Auto: auto-approves read/search tools; prompts before commands or edits."
+                            else -> "Request Review: prompts before every tool or command."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }

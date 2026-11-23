@@ -12,9 +12,9 @@ android {
     defaultConfig {
         applicationId = "com.hambalapps.agymobile"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 11
-        versionName = "1.3.0"
+        targetSdk = 28
+        versionCode = 14
+        versionName = "1.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -45,6 +45,7 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        aidl = true
     }
 
     packaging {
@@ -69,6 +70,8 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
