@@ -52,7 +52,8 @@ data class AppPreferences(
     val selectedModel: String,
     val selectedEffort: String,
     val selectedMode: String,
-    val permissionPolicy: String = "request_review"
+    val permissionPolicy: String = "request_review",
+    val geminiApiKey: String = ""
 ) {
     val activeProfile: ConnectionProfile
         get() = profiles.firstOrNull { it.id == activeProfileId } ?: profiles.first()
@@ -70,6 +71,7 @@ class SettingsRepository(private val context: Context) {
         val SELECTED_EFFORT = stringPreferencesKey("selected_effort")
         val SELECTED_MODE = stringPreferencesKey("selected_mode")
         val PERMISSION_POLICY = stringPreferencesKey("permission_policy")
+        val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
     }
 
     private val standaloneDefaultCwd = "${context.filesDir.absolutePath}/engine/home"
@@ -122,7 +124,8 @@ class SettingsRepository(private val context: Context) {
             selectedModel = prefs[Keys.SELECTED_MODEL] ?: "default",
             selectedEffort = prefs[Keys.SELECTED_EFFORT] ?: "medium",
             selectedMode = prefs[Keys.SELECTED_MODE] ?: "default",
-            permissionPolicy = prefs[Keys.PERMISSION_POLICY] ?: "request_review"
+            permissionPolicy = prefs[Keys.PERMISSION_POLICY] ?: "request_review",
+            geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: ""
         )
     }
 
@@ -183,5 +186,12 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setPermissionPolicy(policy: String) {
         context.dataStore.edit { prefs -> prefs[Keys.PERMISSION_POLICY] = policy }
+    }
+
+    suspend fun setGeminiApiKey(apiKey: String) {
+        context.dataStore.edit { prefs ->
+            if (apiKey.isBlank()) prefs.remove(Keys.GEMINI_API_KEY)
+            else prefs[Keys.GEMINI_API_KEY] = apiKey.trim()
+        }
     }
 }

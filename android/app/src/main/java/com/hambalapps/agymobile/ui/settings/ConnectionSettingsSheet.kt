@@ -52,6 +52,7 @@ fun ConnectionSettingsSheet(
     standaloneProgress: Float? = null,
     detectedAbi: String = "",
     onStartStandaloneEngine: (includeToolchain: Boolean) -> Unit = {},
+    onUpdateStandaloneAgy: () -> Unit = {},
     onInstallToolchain: () -> Unit = {},
     onAutoSetupBridge: (useRootSu: Boolean) -> Unit,
     onSaveProfile: (ConnectionProfile) -> Unit,
@@ -176,6 +177,18 @@ fun ConnectionSettingsSheet(
                             shape = M3ExpressiveShape.groupRightShape
                         ) {
                             Text(if (standaloneToolchainInstalled) "Reinstall Git/Node" else "+ Git & Node/NPM")
+                        }
+                    }
+                    if (standaloneInstalled) {
+                        OutlinedButton(
+                            onClick = onUpdateStandaloneAgy,
+                            enabled = !isBootstrapping,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 44.dp),
+                            shape = M3ExpressiveShape.Full
+                        ) {
+                            Text("Check & Update agy CLI")
                         }
                     }
                     Row(

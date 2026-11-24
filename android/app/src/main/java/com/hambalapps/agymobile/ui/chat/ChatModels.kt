@@ -10,6 +10,10 @@ import com.hambalapps.agymobile.data.acp.HealthResponse
 import com.hambalapps.agymobile.data.acp.ModelQuotaInfo
 import com.hambalapps.agymobile.data.acp.QuotaSummaryResponse
 import com.hambalapps.agymobile.data.acp.SessionSummary
+import com.hambalapps.agymobile.data.engine.GoogleLoginState
+import com.hambalapps.agymobile.data.engine.InstalledPluginInfo
+import com.hambalapps.agymobile.data.engine.MarketplaceCatalogItem
+import com.hambalapps.agymobile.data.engine.SkillItemInfo
 import com.hambalapps.agymobile.data.local.AppPreferences
 import com.hambalapps.agymobile.data.local.ConnectionProfile
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
@@ -101,9 +105,20 @@ data class ChatUiState(
     val isLoadingQuota: Boolean = false,
     val standaloneInstalled: Boolean = false,
     val standaloneToolchainInstalled: Boolean = false,
+    val standaloneSignedIn: Boolean = false,
+    val standaloneAgyVersion: String? = null,
     val standaloneProgress: Float? = null,
     val standaloneStatus: String? = null,
-    val detectedAbi: String = ""
+    val detectedAbi: String = "",
+    val googleLoginState: GoogleLoginState = GoogleLoginState(),
+    val marketplaceCatalog: List<MarketplaceCatalogItem> = emptyList(),
+    val installedPlugins: List<InstalledPluginInfo> = emptyList(),
+    val isLoadingPlugins: Boolean = false,
+    val pluginActionTarget: String? = null,
+    val pluginStatusMessage: String? = null,
+    val globalRulesText: String = "",
+    val workspaceRulesText: String = "",
+    val discoveredSkills: List<SkillItemInfo> = emptyList()
 ) {
     val activeProfile: ConnectionProfile?
         get() = preferences?.activeProfile

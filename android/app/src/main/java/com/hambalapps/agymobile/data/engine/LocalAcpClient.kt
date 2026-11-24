@@ -6,6 +6,7 @@ import com.hambalapps.agymobile.data.acp.AcpRpcException
 import com.hambalapps.agymobile.data.acp.JsonRpcEnvelope
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -42,7 +44,7 @@ class LocalAcpClient(
     private val engineManager: StandaloneEngineManager
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> })
     private val nextId = AtomicInteger(1)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JsonElement>>()
     private val writeLock = Any()
@@ -94,12 +96,14 @@ class LocalAcpClient(
                 _connectionState.value = BridgeConnectionState.CONNECTED
 
                 launch {
-                    started.errorStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                        reader.forEachLine { line ->
-                            if (line.contains("FATAL", ignoreCase = true) ||
-                                line.contains("panic:", ignoreCase = true)
-                            ) {
-                                _events.tryEmit(AcpClientEvent.BridgeNotice(line))
+                    runCatching {
+                        started.errorStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                            reader.forEachLine { line ->
+                                if (line.contains("FATAL", ignoreCase = true) ||
+                                    line.contains("panic:", ignoreCase = true)
+                                ) {
+                                    _events.tryEmit(AcpClientEvent.BridgeNotice(line))
+                                }
                             }
                         }
                     }
@@ -109,7 +113,7 @@ class LocalAcpClient(
                     reader.forEachLine { rawLine ->
                         val line = rawLine.trim()
                         if (line.isNotEmpty()) {
-                            handleIncoming(line)
+                            runCatching { handleIncoming(line) }
                         }
                     }
                 }
@@ -147,7 +151,7 @@ class LocalAcpClient(
     private fun handleIncoming(raw: String) {
         val envelope = runCatching { json.decodeFromString<JsonRpcEnvelope>(raw) }.getOrNull() ?: return
 
-        if (envelope.id != null && envelope.method == null) {
+        if (envelope.id != null && envelope.id !is JsonNull && envelope.method == null) {
             val key = envelope.id.jsonPrimitive.contentOrNull ?: envelope.id.toString()
             val waiter = pending.remove(key) ?: return
             if (envelope.error != null) {

@@ -1,5 +1,6 @@
 package com.hambalapps.agymobile.ui.sheets
 
+import android.content.ClipboardManager
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -13,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material3.AssistChip
@@ -35,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
@@ -51,8 +54,13 @@ fun TerminalSheet(
     onConsumedPendingCommand: () -> Unit = {},
     onDoneAuthReconnect: () -> Unit = {},
     onOpenUrl: (url: String, force: Boolean) -> Unit = { _, _ -> },
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    isStandalone: Boolean = false,
+    standaloneToolchainInstalled: Boolean = false,
+    onUpdateStandaloneAgy: () -> Unit = {},
+    onInstallToolchain: () -> Unit = {}
 ) {
+    val context = LocalContext.current
     val output by ptyClient.output.collectAsState()
     val connected by ptyClient.connected.collectAsState()
     val detectedUrl by ptyClient.detectedUrl.collectAsState()
@@ -127,21 +135,55 @@ fun TerminalSheet(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                listOf(
-                    "Install agy CLI" to TermuxBridgeBootstrap.AGY_TERMUX_INSTALL_CMD,
-                    "agy acp --login" to "agy acp --login",
-                    "agy --version" to "agy --version",
-                    "su -c id" to "su -c id",
-                    "rish -c id" to "rish -c id",
-                    "Ctrl+C" to "\u0003"
-                ).forEach { (label, payload) ->
+                if (isStandalone) {
                     AssistChip(
                         onClick = {
-                            if (payload == "\u0003") ptyClient.sendRaw(payload)
-                            else ptyClient.sendCommand(payload)
+                            onDismiss()
+                            onUpdateStandaloneAgy()
                         },
-                        label = { Text(label) }
+                        label = { Text("Update agy") }
                     )
+                    if (!standaloneToolchainInstalled) {
+                        AssistChip(
+                            onClick = {
+                                onDismiss()
+                                onInstallToolchain()
+                            },
+                            label = { Text("Install Git & NPM") }
+                        )
+                    }
+                    listOf(
+                        "Google Login" to "SSH_CONNECTION='127.0.0.1 22 127.0.0.1 22' agy acp --login",
+                        "agy plugin list" to "agy plugin list",
+                        "agy --version" to "agy --version",
+                        "rish -c id" to "rish -c id",
+                        "Ctrl+C" to "\u0003"
+                    ).forEach { (label, payload) ->
+                        AssistChip(
+                            onClick = {
+                                if (payload == "\u0003") ptyClient.sendRaw(payload)
+                                else ptyClient.sendCommand(payload)
+                            },
+                            label = { Text(label) }
+                        )
+                    }
+                } else {
+                    listOf(
+                        "Install agy CLI" to TermuxBridgeBootstrap.AGY_TERMUX_INSTALL_CMD,
+                        "agy acp --login" to "SSH_CONNECTION='127.0.0.1 22 127.0.0.1 22' agy acp --login",
+                        "agy --version" to "agy --version",
+                        "su -c id" to "su -c id",
+                        "rish -c id" to "rish -c id",
+                        "Ctrl+C" to "\u0003"
+                    ).forEach { (label, payload) ->
+                        AssistChip(
+                            onClick = {
+                                if (payload == "\u0003") ptyClient.sendRaw(payload)
+                                else ptyClient.sendCommand(payload)
+                            },
+                            label = { Text(label) }
+                        )
+                    }
                 }
             }
 
@@ -186,7 +228,7 @@ fun TerminalSheet(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
@@ -197,6 +239,17 @@ fun TerminalSheet(
                     modifier = Modifier.weight(1f),
                     shape = M3ExpressiveShape.Full
                 )
+                IconButton(
+                    onClick = {
+                        val cm = context.getSystemService(ClipboardManager::class.java)
+                        val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                        if (clip.isNotBlank()) {
+                            cmdInput = if (cmdInput.isBlank()) clip else "$cmdInput$clip"
+                        }
+                    }
+                ) {
+                    Icon(Icons.Rounded.ContentPaste, contentDescription = "Paste from clipboard")
+                }
                 IconButton(
                     onClick = {
                         if (cmdInput.isNotBlank()) {

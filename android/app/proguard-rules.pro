@@ -14,3 +14,12 @@
 -keepclasseswithmembers class com.hambalapps.agymobile.data.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
+
+# Keep Shizuku UserService & AIDL interfaces
+-keep class com.hambalapps.agymobile.data.engine.ShizukuShellService {
+    public <init>();
+    *;
+}
+-keep interface com.hambalapps.agymobile.data.engine.IShizukuShellService { *; }
+-keep class com.hambalapps.agymobile.data.engine.IShizukuShellService$Stub { *; }
+-dontwarn rikka.shizuku.**

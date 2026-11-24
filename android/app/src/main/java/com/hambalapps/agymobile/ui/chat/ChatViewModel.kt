@@ -18,9 +18,11 @@ import com.hambalapps.agymobile.data.acp.BridgeApiClient
 import com.hambalapps.agymobile.data.acp.HealthResponse
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
 import com.hambalapps.agymobile.data.engine.LocalAcpClient
+import com.hambalapps.agymobile.data.engine.PluginMarketplaceManager
 import com.hambalapps.agymobile.data.engine.QuotaClient
 import com.hambalapps.agymobile.data.engine.ShizukuBridge
 import com.hambalapps.agymobile.data.engine.StandaloneEngineManager
+import com.hambalapps.agymobile.data.engine.StandaloneLoginRunner
 import com.hambalapps.agymobile.data.local.ConnectionProfile
 import com.hambalapps.agymobile.data.local.SettingsRepository
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
@@ -50,6 +52,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val acpClient = AcpWebSocketClient()
     val engineManager = StandaloneEngineManager(application)
     private val localAcpClient = LocalAcpClient(engineManager)
+    private val loginRunner = StandaloneLoginRunner(engineManager)
+    private val pluginManager = PluginMarketplaceManager(engineManager)
     private val quotaClient = QuotaClient()
     private val bridgeApi = BridgeApiClient()
     val ptyClient = PtyWebSocketClient()
@@ -58,6 +62,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ChatUiState(
             standaloneInstalled = engineManager.isAgyInstalled(),
             standaloneToolchainInstalled = engineManager.isToolchainInstalled(),
+            standaloneSignedIn = engineManager.isSignedIn(),
+            standaloneAgyVersion = engineManager.installedAgyVersion(),
             detectedAbi = engineManager.detectArch().abi
         )
     )
@@ -97,6 +103,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         observePreferences()
         observeConnectionState()
         observeAcpEvents()
+        viewModelScope.launch {
+            loginRunner.state.collect { loginState ->
+                _uiState.update { it.copy(googleLoginState = loginState) }
+            }
+        }
     }
 
     private fun isStandaloneActive(): Boolean = _uiState.value.activeProfile?.isStandalone == true
@@ -131,6 +142,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 standaloneInstalled = engineManager.isAgyInstalled(),
                 standaloneToolchainInstalled = engineManager.isToolchainInstalled(),
+                standaloneSignedIn = engineManager.isSignedIn(),
+                standaloneAgyVersion = engineManager.installedAgyVersion(),
                 detectedAbi = engineManager.detectArch().abi
             )
         }
@@ -140,6 +153,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settingsRepo.preferencesFlow.collect { prefs ->
                 val profile = prefs.activeProfile
+                if (prefs.geminiApiKey.isNotBlank()) {
+                    localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to prefs.geminiApiKey))
+                }
                 _uiState.update { state ->
                     state.copy(
                         preferences = prefs,
@@ -419,10 +435,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun submitGeminiApiKey(apiKey: String) {
         val profile = _uiState.value.activeProfile ?: return
+        val cleanKey = apiKey.trim()
         viewModelScope.launch {
             _uiState.update { it.copy(authInProgress = true, authError = null) }
             if (profile.isStandalone) {
-                localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to apiKey))
+                settingsRepo.setGeminiApiKey(cleanKey)
+                engineManager.setModelProviderGemini(true)
+                localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to cleanKey))
+                refreshStandaloneStatus()
                 _uiState.update {
                     it.copy(
                         authInProgress = false,
@@ -433,7 +453,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 localAcpClient.start(_uiState.value.workspaceCwd)
                 return@launch
             }
-            bridgeApi.setEnvAndRestart(profile, buildJsonObject { put("GEMINI_API_KEY", apiKey) })
+            bridgeApi.setEnvAndRestart(profile, buildJsonObject { put("GEMINI_API_KEY", cleanKey) })
                 .onSuccess {
                     delay(800)
                     _uiState.update {
@@ -450,6 +470,69 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(authInProgress = false, authError = "Failed to set key: ${err.message}")
                     }
                 }
+        }
+    }
+
+    fun startGuidedGoogleLogin() {
+        val profile = _uiState.value.activeProfile
+        if (profile != null && !profile.isStandalone) {
+            openTerminalForAuth("SSH_CONNECTION='127.0.0.1 22 127.0.0.1 22' agy acp --login")
+            return
+        }
+        viewModelScope.launch {
+            if (!engineManager.isAgyInstalled()) {
+                _uiState.update {
+                    it.copy(
+                        isBootstrapping = true,
+                        standaloneProgress = 0.05f,
+                        standaloneStatus = "Installing agy CLI before Google sign-in…"
+                    )
+                }
+                val res = engineManager.installOrUpdateAgy { msg, frac ->
+                    _uiState.update {
+                        it.copy(standaloneProgress = frac, standaloneStatus = msg)
+                    }
+                }
+                refreshStandaloneStatus()
+                _uiState.update { it.copy(isBootstrapping = false, standaloneProgress = null) }
+                if (res.isFailure) {
+                    _uiState.update {
+                        it.copy(authError = "Could not install agy: ${res.exceptionOrNull()?.message}")
+                    }
+                    return@launch
+                }
+            }
+            _uiState.update { it.copy(authError = null) }
+            loginRunner.startLogin { onGuidedLoginCompleted() }
+        }
+    }
+
+    fun submitGoogleAuthCode(code: String) {
+        loginRunner.submitCode(code) { onGuidedLoginCompleted() }
+    }
+
+    fun cancelGuidedGoogleLogin() {
+        loginRunner.cancel()
+    }
+
+    private fun onGuidedLoginCompleted() {
+        viewModelScope.launch {
+            settingsRepo.setGeminiApiKey("")
+            localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to ""))
+            engineManager.setModelProviderGemini(false)
+            refreshStandaloneStatus()
+            _uiState.update {
+                it.copy(
+                    authRequired = false,
+                    authInProgress = false,
+                    authError = null,
+                    statusBanner = null,
+                    activeSheet = ActiveSheet.NONE
+                )
+            }
+            if (isStandaloneActive()) {
+                localAcpClient.start(_uiState.value.workspaceCwd)
+            }
         }
     }
 
@@ -846,13 +929,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun logoutFromAgent() {
         val supportsLogout = _uiState.value.initializeResult?.supportsLogout == true
-        if (!supportsLogout) {
+        val standalone = isStandaloneActive()
+        if (!supportsLogout && !standalone) {
             openTerminalForAuth("agy /logout")
             return
         }
         viewModelScope.launch {
             runCatching {
-                acpRequest(method = "logout", params = buildJsonObject { })
+                if (supportsLogout) acpRequest(method = "logout", params = buildJsonObject { })
+            }
+            settingsRepo.setGeminiApiKey("")
+            localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to ""))
+            if (standalone) {
+                engineManager.setModelProviderGemini(false)
+                runCatching { engineManager.oauthTokenFile.delete() }
+                localAcpClient.disconnect()
+                refreshStandaloneStatus()
             }
             _uiState.update {
                 it.copy(
@@ -1004,16 +1096,175 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshConfig() {
         val profile = _uiState.value.activeProfile ?: return
         if (profile.isStandalone) {
-            val settingsFile = java.io.File(engineManager.homeDir, ".gemini/antigravity-cli/settings.json")
+            val settingsFile = engineManager.cliSettingsFile
             val text = if (settingsFile.exists()) runCatching { settingsFile.readText() }.getOrDefault("{}") else "{}"
             _uiState.update { it.copy(bridgeSettingsJson = text) }
+        } else {
+            viewModelScope.launch {
+                bridgeApi.getConfig(profile).onSuccess { cfg ->
+                    _uiState.update { it.copy(bridgeSettingsJson = cfg.toString()) }
+                }
+            }
+        }
+        refreshMarketplaceAndPlugins()
+    }
+
+    fun refreshMarketplaceAndPlugins(forceCatalogRefresh: Boolean = false) {
+        val cwd = _uiState.value.workspaceCwd
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingPlugins = true) }
+            val catalog = pluginManager.fetchCatalog(forceCatalogRefresh)
+            val installed = if (isStandaloneActive()) {
+                pluginManager.listInstalledPlugins(cwd)
+            } else {
+                emptyList()
+            }
+            val globalRules = if (isStandaloneActive()) pluginManager.readGlobalRules() else ""
+            val wsRules = if (isStandaloneActive()) pluginManager.readWorkspaceRules(cwd) else ""
+            val skills = if (isStandaloneActive()) pluginManager.listSkills(cwd) else emptyList()
+            _uiState.update {
+                it.copy(
+                    marketplaceCatalog = catalog,
+                    installedPlugins = installed,
+                    globalRulesText = globalRules,
+                    workspaceRulesText = wsRules,
+                    discoveredSkills = skills,
+                    isLoadingPlugins = false
+                )
+            }
+        }
+    }
+
+    fun installPlugin(specOrUrl: String) {
+        val trimmed = specOrUrl.trim()
+        if (trimmed.isEmpty()) return
+        if (!isStandaloneActive()) {
+            openTerminalWithCommand("agy plugin install \"$trimmed\"")
             return
         }
         viewModelScope.launch {
-            bridgeApi.getConfig(profile).onSuccess { cfg ->
-                _uiState.update { it.copy(bridgeSettingsJson = cfg.toString()) }
+            _uiState.update {
+                it.copy(pluginActionTarget = trimmed, pluginStatusMessage = "Installing $trimmed…")
+            }
+            val res = pluginManager.installPlugin(trimmed)
+            val installed = pluginManager.listInstalledPlugins(_uiState.value.workspaceCwd)
+            _uiState.update {
+                it.copy(
+                    pluginActionTarget = null,
+                    installedPlugins = installed,
+                    pluginStatusMessage = res.fold(
+                        onSuccess = { msg -> msg },
+                        onFailure = { err -> err.message ?: "Install failed" }
+                    )
+                )
+            }
+            if (res.isSuccess && !_uiState.value.isStreaming && _uiState.value.sessionId != null) {
+                runCatching { createNewSession() }
             }
         }
+    }
+
+    fun setPluginEnabled(name: String, enabled: Boolean) {
+        if (!isStandaloneActive()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(pluginActionTarget = name) }
+            val res = pluginManager.setPluginEnabled(name, enabled)
+            val installed = pluginManager.listInstalledPlugins(_uiState.value.workspaceCwd)
+            _uiState.update {
+                it.copy(
+                    pluginActionTarget = null,
+                    installedPlugins = installed,
+                    pluginStatusMessage = res.fold(
+                        onSuccess = { msg -> msg },
+                        onFailure = { err -> err.message ?: "Toggle failed" }
+                    )
+                )
+            }
+        }
+    }
+
+    fun uninstallPlugin(name: String) {
+        if (!isStandaloneActive()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(pluginActionTarget = name) }
+            val res = pluginManager.uninstallPlugin(name)
+            val installed = pluginManager.listInstalledPlugins(_uiState.value.workspaceCwd)
+            _uiState.update {
+                it.copy(
+                    pluginActionTarget = null,
+                    installedPlugins = installed,
+                    pluginStatusMessage = res.fold(
+                        onSuccess = { msg -> msg },
+                        onFailure = { err -> err.message ?: "Uninstall failed" }
+                    )
+                )
+            }
+        }
+    }
+
+    fun saveRules(isGlobal: Boolean, content: String) {
+        if (!isStandaloneActive()) return
+        val cwd = _uiState.value.workspaceCwd
+        viewModelScope.launch {
+            val res = if (isGlobal) pluginManager.writeGlobalRules(content)
+            else pluginManager.writeWorkspaceRules(cwd, content)
+            _uiState.update {
+                it.copy(
+                    globalRulesText = if (isGlobal) content else it.globalRulesText,
+                    workspaceRulesText = if (!isGlobal) content else it.workspaceRulesText,
+                    pluginStatusMessage = if (res.isSuccess) {
+                        if (isGlobal) "Saved global rules (~/.gemini/config/GEMINI.md)"
+                        else "Saved workspace rules (GEMINI.md)"
+                    } else {
+                        "Failed to save rules: ${res.exceptionOrNull()?.message}"
+                    }
+                )
+            }
+        }
+    }
+
+    fun createOrSaveSkill(name: String, content: String, isGlobal: Boolean) {
+        if (!isStandaloneActive()) return
+        val cwd = _uiState.value.workspaceCwd
+        viewModelScope.launch {
+            val res = pluginManager.saveSkill(name, content, cwd, isGlobal)
+            val skills = pluginManager.listSkills(cwd)
+            _uiState.update {
+                it.copy(
+                    discoveredSkills = skills,
+                    pluginStatusMessage = if (res.isSuccess) "Saved skill '$name'"
+                    else "Failed to save skill: ${res.exceptionOrNull()?.message}"
+                )
+            }
+        }
+    }
+
+    fun updateCliSettingBoolean(key: String, enabled: Boolean) {
+        if (!isStandaloneActive()) return
+        viewModelScope.launch {
+            runCatching {
+                val file = engineManager.cliSettingsFile
+                file.parentFile?.mkdirs()
+                val obj = if (file.exists()) {
+                    runCatching { org.json.JSONObject(file.readText()) }.getOrDefault(org.json.JSONObject())
+                } else {
+                    org.json.JSONObject()
+                }
+                obj.put(key, enabled)
+                val formatted = obj.toString(2) + "\n"
+                file.writeText(formatted, Charsets.UTF_8)
+                _uiState.update {
+                    it.copy(
+                        bridgeSettingsJson = formatted,
+                        pluginStatusMessage = "Updated $key = $enabled in settings.json"
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearPluginStatus() {
+        _uiState.update { it.copy(pluginStatusMessage = null) }
     }
 
     fun approveArtifact(artifactId: String, approved: Boolean) {
@@ -1078,9 +1329,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun startStandaloneEngine(includeToolchain: Boolean = false) {
+    fun updateStandaloneAgy() {
+        startStandaloneEngine(includeToolchain = false, forceUpdateAgy = true)
+    }
+
+    fun startStandaloneEngine(includeToolchain: Boolean = false, forceUpdateAgy: Boolean = false) {
         if (_uiState.value.isBootstrapping) return
         viewModelScope.launch {
+            localAcpClient.disconnect()
             val standaloneProfile = _uiState.value.preferences?.profiles
                 ?.firstOrNull { it.isStandalone || it.id == "local-standalone" }
                 ?: ConnectionProfile(
@@ -1102,7 +1358,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-            val agyRes = engineManager.installOrUpdateAgy { msg, frac ->
+            val agyRes = engineManager.installOrUpdateAgy(forceUpdate = forceUpdateAgy) { msg, frac ->
                 val scaled = if (includeToolchain) frac * 0.4f else frac
                 _uiState.update {
                     it.copy(
@@ -1146,9 +1402,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
+            val savedKey = _uiState.value.preferences?.geminiApiKey.orEmpty()
+            if (savedKey.isNotBlank()) {
+                engineManager.setModelProviderGemini(true)
+                localAcpClient.setEnvOverrides(mapOf("GEMINI_API_KEY" to savedKey))
+            }
+
             refreshStandaloneStatus()
             val priv = engineManager.detectPrivilegeLevel()
             val arch = engineManager.detectArch()
+            val needsAuth = !engineManager.isSignedIn()
             _uiState.update {
                 it.copy(
                     isBootstrapping = false,
@@ -1165,7 +1428,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     ),
                     standaloneStatus = "Standalone engine online (${arch.abi}, privilege=$priv)",
                     bootstrapStatus = "Standalone engine online (${arch.abi}, privilege=$priv)",
-                    statusBanner = null
+                    statusBanner = null,
+                    authRequired = needsAuth,
+                    activeSheet = if (needsAuth && it.activeSheet == ActiveSheet.NONE) ActiveSheet.AUTH else it.activeSheet
                 )
             }
             localAcpClient.start(engineManager.homeDir.absolutePath)
@@ -1175,6 +1440,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun installStandaloneToolchain() {
         if (_uiState.value.isBootstrapping) return
         viewModelScope.launch {
+            localAcpClient.disconnect()
             _uiState.update {
                 it.copy(
                     isBootstrapping = true,
@@ -1209,7 +1475,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 )
             }
-            if (tcRes.isSuccess && isStandaloneActive()) {
+            if (isStandaloneActive() && engineManager.isAgyInstalled()) {
                 localAcpClient.start(_uiState.value.workspaceCwd)
             }
         }

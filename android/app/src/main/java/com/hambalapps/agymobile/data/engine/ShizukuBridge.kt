@@ -4,7 +4,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import com.hambalapps.agymobile.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -76,9 +78,11 @@ object ShizukuBridge {
             serverSocket = ss
             localPort = ss.localPort
             executor.execute {
-                while (!ss.isClosed) {
-                    val client = runCatching { ss.accept() }.getOrNull() ?: break
-                    executor.execute { handleLocalHttp(client) }
+                runCatching {
+                    while (!ss.isClosed) {
+                        val client = runCatching { ss.accept() }.getOrNull() ?: break
+                        executor.execute { runCatching { handleLocalHttp(client) } }
+                    }
                 }
             }
             return localPort
@@ -114,9 +118,11 @@ object ShizukuBridge {
                         if (!def.isCompleted) def.complete(null)
                     }
                 }
-                runCatching { Shizuku.bindUserService(args, conn) }.onFailure {
-                    pendingBind = null
-                    def.complete(null)
+                Handler(Looper.getMainLooper()).post {
+                    runCatching { Shizuku.bindUserService(args, conn) }.onFailure {
+                        pendingBind = null
+                        if (!def.isCompleted) def.complete(null)
+                    }
                 }
             }
         }
@@ -172,12 +178,16 @@ object ShizukuBridge {
             }
 
             val svc = service
-            val (exitCode, outText) = if (svc != null && svc.asBinder().pingBinder()) {
-                val b = svc.exec(cmd)
-                val code = b.getInt("exitCode", 1)
-                val out = b.getString("stdout").orEmpty()
-                val err = b.getString("stderr").orEmpty()
-                code to (out + err)
+            val (exitCode, outText) = if (svc != null && runCatching { svc.asBinder().pingBinder() }.getOrDefault(false)) {
+                runCatching {
+                    val b = svc.exec(cmd)
+                    val code = b.getInt("exitCode", 1)
+                    val out = b.getString("stdout").orEmpty()
+                    val err = b.getString("stderr").orEmpty()
+                    code to (out + err)
+                }.getOrElse { err ->
+                    126 to "Shizuku exec error: ${err.message}\n"
+                }
             } else {
                 126 to "Shizuku service not bound. Open Agy Mobile and grant Shizuku permission.\n"
             }

@@ -2,6 +2,7 @@ package com.hambalapps.agymobile.data.acp
 
 import com.hambalapps.agymobile.data.engine.StandaloneEngineManager
 import com.hambalapps.agymobile.data.local.ConnectionProfile
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,7 +25,7 @@ class PtyWebSocketClient(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> })
     private val _output = MutableStateFlow("")
     val output: StateFlow<String> = _output.asStateFlow()
 

@@ -9,12 +9,16 @@ import android.system.Os
 import com.hambalapps.agymobile.BuildConfig
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -59,6 +63,7 @@ class StandaloneEngineManager(
     val tmpDir: File = File(engineDir, "tmp")
     val workspaceDir: File = File(homeDir, "workspace")
     val agyBin: File = File(usrDir, "bin/agy")
+    val agyRealBin: File = File(usrDir, "libexec/agy.bin")
     val nodeBin: File = File(usrDir, "bin/node")
     val npmBin: File = File(usrDir, "bin/npm")
     val gitBin: File = File(usrDir, "bin/git")
@@ -66,6 +71,8 @@ class StandaloneEngineManager(
     val bridgeDir: File = File(homeDir, ".agy-bridge")
     val mcpScript: File = File(bridgeDir, "dist/mcp/android-control-mcp.js")
     val oauthTokenFile: File = File(homeDir, ".gemini/antigravity-cli/antigravity-oauth-token")
+    val cliSettingsFile: File = File(homeDir, ".gemini/antigravity-cli/settings.json")
+    val browserSpoolDir: File = File(tmpDir, "browser_open")
     private val agyVersionFile: File = File(engineDir, "agy.version")
     private val toolchainMarker: File = File(engineDir, "toolchain.ok")
 
@@ -88,7 +95,9 @@ class StandaloneEngineManager(
         }
     }
 
-    fun isAgyInstalled(): Boolean = agyBin.exists() && agyBin.length() > 1_000_000L
+    fun isAgyInstalled(): Boolean =
+        (agyRealBin.exists() && agyRealBin.length() > 1_000_000L) ||
+            (agyBin.exists() && agyBin.length() > 1_000_000L)
 
     fun isToolchainInstalled(): Boolean =
         toolchainMarker.exists() && bashBin.exists() && nodeBin.exists() && gitBin.exists()
@@ -99,13 +108,73 @@ class StandaloneEngineManager(
     fun installedAgyVersion(): String? =
         if (agyVersionFile.exists()) agyVersionFile.readText().trim().ifBlank { null } else null
 
+    fun hasGeminiApiKeyConfigured(): Boolean {
+        if (!cliSettingsFile.exists()) return false
+        return runCatching {
+            val obj = JSONObject(cliSettingsFile.readText())
+            obj.optString("modelProvider") == "gemini"
+        }.getOrDefault(false)
+    }
+
+    fun isSignedIn(): Boolean =
+        (oauthTokenFile.exists() && oauthTokenFile.length() > 20L) || hasGeminiApiKeyConfigured()
+
+    fun setModelProviderGemini(enabled: Boolean) {
+        runCatching {
+            cliSettingsFile.parentFile?.mkdirs()
+            val obj = if (cliSettingsFile.exists()) {
+                runCatching { JSONObject(cliSettingsFile.readText()) }.getOrDefault(JSONObject())
+            } else {
+                JSONObject()
+            }
+            if (enabled) {
+                obj.put("modelProvider", "gemini")
+            } else {
+                obj.remove("modelProvider")
+            }
+            cliSettingsFile.writeText(obj.toString(2) + "\n", Charsets.UTF_8)
+        }
+    }
+
     fun ensureBaseDirs() {
         usrDir.mkdirs()
         File(usrDir, "bin").mkdirs()
         File(usrDir, "lib").mkdirs()
+        File(usrDir, "libexec").mkdirs()
         homeDir.mkdirs()
         tmpDir.mkdirs()
+        browserSpoolDir.mkdirs()
         workspaceDir.mkdirs()
+    }
+
+    fun ensureAgyWrapper() {
+        runCatching {
+            File(usrDir, "libexec").mkdirs()
+            File(usrDir, "bin").mkdirs()
+            if (!agyRealBin.exists() && agyBin.exists() && agyBin.length() > 1_000_000L) {
+                if (!agyBin.renameTo(agyRealBin)) {
+                    agyBin.copyTo(agyRealBin, overwrite = true)
+                    agyBin.delete()
+                }
+            }
+            if (!agyRealBin.exists()) return@runCatching
+            chmod755(agyRealBin)
+            val arch = detectArch()
+            val wrapperScript = if (arch.isStaticBinary) {
+                "#!/system/bin/sh\nexec \"${agyRealBin.absolutePath}\" \"${'$'}@\"\n"
+            } else {
+                val linker = File("/system/bin/linker64")
+                if (linker.exists()) {
+                    "#!/system/bin/sh\nexec /system/bin/linker64 \"${agyRealBin.absolutePath}\" \"${'$'}@\"\n"
+                } else {
+                    "#!/system/bin/sh\nexec \"${agyRealBin.absolutePath}\" \"${'$'}@\"\n"
+                }
+            }
+            if (!agyBin.exists() || agyBin.length() > 4096L || agyBin.readText() != wrapperScript) {
+                agyBin.writeText(wrapperScript, Charsets.UTF_8)
+            }
+            chmod755(agyBin)
+        }
     }
 
     fun buildLinkerCommand(executable: File, args: List<String> = emptyList()): List<String> {
@@ -118,11 +187,13 @@ class StandaloneEngineManager(
     }
 
     fun buildAgyCommand(args: List<String> = emptyList()): List<String> {
+        ensureAgyWrapper()
+        val targetBin = if (agyRealBin.exists()) agyRealBin else agyBin
         val arch = detectArch()
         return if (arch.isStaticBinary) {
-            listOf(agyBin.absolutePath) + args
+            listOf(targetBin.absolutePath) + args
         } else {
-            buildLinkerCommand(agyBin, args)
+            buildLinkerCommand(targetBin, args)
         }
     }
 
@@ -190,11 +261,13 @@ class StandaloneEngineManager(
             ensureRishShim()
         }
         val browserPort = startLocalBrowserServer()
+        startBrowserSpoolWatcher()
         if (browserPort > 0) {
             env["AGY_BROWSER_PORT"] = browserPort.toString()
-            ensureBrowserShims()
-            env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
         }
+        ensureBrowserShims()
+        ensureAgyWrapper()
+        env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
         return env
     }
 
@@ -227,6 +300,11 @@ class StandaloneEngineManager(
 
     private val localBrowserPort = AtomicInteger(-1)
     private var localBrowserServer: ServerSocket? = null
+    @Volatile
+    private var browserSpoolThreadStarted = false
+
+    private val _lastBrowserUrl = MutableStateFlow<String?>(null)
+    val lastBrowserUrl: StateFlow<String?> = _lastBrowserUrl.asStateFlow()
 
     @Volatile
     private var lastOpenedBrowserUrl: String? = null
@@ -239,6 +317,7 @@ class StandaloneEngineManager(
         if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
             return false
         }
+        _lastBrowserUrl.value = trimmed
         val now = System.currentTimeMillis()
         if (!force && trimmed == lastOpenedBrowserUrl && (now - lastOpenedBrowserAtMs) < 4_000L) {
             return true
@@ -255,6 +334,31 @@ class StandaloneEngineManager(
     }
 
     @Synchronized
+    fun startBrowserSpoolWatcher() {
+        if (browserSpoolThreadStarted) return
+        browserSpoolThreadStarted = true
+        browserSpoolDir.mkdirs()
+        Thread({
+            while (true) {
+                runCatching {
+                    val files = browserSpoolDir.listFiles()
+                    files?.sortedBy { it.lastModified() }?.forEach { file ->
+                        val url = runCatching { file.readText(Charsets.UTF_8).trim() }.getOrNull()
+                        runCatching { file.delete() }
+                        if (!url.isNullOrBlank()) {
+                            openUrlInBrowser(url)
+                        }
+                    }
+                }
+                runCatching { Thread.sleep(250L) }
+            }
+        }, "AgyBrowserSpool").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    @Synchronized
     fun startLocalBrowserServer(): Int {
         val existing = localBrowserPort.get()
         if (existing > 0 && localBrowserServer?.isClosed == false) return existing
@@ -268,7 +372,7 @@ class StandaloneEngineManager(
                 while (!server.isClosed) {
                     runCatching {
                         val sock = server.accept()
-                        Thread({ handleBrowserClient(sock) }, "AgyBrowserReq").start()
+                        Thread({ runCatching { handleBrowserClient(sock) } }, "AgyBrowserReq").start()
                     }
                 }
             }, "AgyBrowserBridge").apply {
@@ -320,25 +424,30 @@ class StandaloneEngineManager(
 
     private fun ensureBrowserShims() {
         val script = """#!/system/bin/sh
-if [ -z "${'$'}AGY_BROWSER_PORT" ]; then
-  echo "Browser bridge port not configured" >&2
-  exit 1
-fi
 URL="${'$'}1"
 if [ -z "${'$'}URL" ]; then
   echo "Usage: ${'$'}0 <url>" >&2
   exit 1
 fi
-CURL_BIN="${'$'}{PREFIX}/bin/curl"
-if [ -x "${'$'}CURL_BIN" ]; then
-  "${'$'}CURL_BIN" -sS -f -X POST --data-binary "${'$'}URL" "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/open" >/dev/null
-  exit ${'$'}?
+if [ -n "${'$'}TMPDIR" ]; then
+  SPOOL_DIR="${'$'}TMPDIR/browser_open"
+  mkdir -p "${'$'}SPOOL_DIR" 2>/dev/null
+  if printf '%s\n' "${'$'}URL" > "${'$'}SPOOL_DIR/req_${'$'}${'$'}.url" 2>/dev/null; then
+    exit 0
+  fi
 fi
-NODE_BIN="${'$'}{PREFIX}/bin/node"
-if [ -x "${'$'}NODE_BIN" ]; then
-  exec "${'$'}NODE_BIN" -e 'const http=require("http");const req=http.request("http://127.0.0.1:"+process.env.AGY_BROWSER_PORT+"/open",{method:"POST"},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1));});req.on("error",()=>process.exit(1));req.end(process.argv[1]);' "${'$'}URL"
+if [ -n "${'$'}AGY_BROWSER_PORT" ]; then
+  CURL_BIN="${'$'}{PREFIX}/bin/curl"
+  if [ -x "${'$'}CURL_BIN" ]; then
+    "${'$'}CURL_BIN" -sS -f -X POST --data-binary "${'$'}URL" "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/open" >/dev/null
+    exit ${'$'}?
+  fi
+  NODE_BIN="${'$'}{PREFIX}/bin/node"
+  if [ -x "${'$'}NODE_BIN" ]; then
+    exec "${'$'}NODE_BIN" -e 'const http=require("http");const req=http.request("http://127.0.0.1:"+process.env.AGY_BROWSER_PORT+"/open",{method:"POST"},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1));});req.on("error",()=>process.exit(1));req.end(process.argv[1]);' "${'$'}URL"
+  fi
 fi
-echo "Neither curl nor node found for browser shim" >&2
+echo "Browser bridge not available for: ${'$'}URL" >&2
 exit 1
 """
         listOf("xdg-open", "termux-open-url", "open").forEach { name ->
@@ -511,11 +620,13 @@ exit 127
     }
 
     suspend fun installOrUpdateAgy(
+        forceUpdate: Boolean = false,
         onProgress: (status: String, progress: Float) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
         runCatching {
             ensureBaseDirs()
             extractBundledBridgeAssets()
+            ensureAgyWrapper()
             val arch = detectArch()
 
             onProgress("Checking ${arch.agyManifest} release manifest…", 0.05f)
@@ -534,7 +645,8 @@ exit 127
                 error("Invalid agy release manifest")
             }
 
-            if (isAgyInstalled() && installedAgyVersion() == version) {
+            if (!forceUpdate && isAgyInstalled() && installedAgyVersion() == version) {
+                ensureAgyWrapper()
                 migrateTermuxCredentialsIfNeeded()
                 onProgress("agy $version already up to date", 1.0f)
                 return@runCatching agyBin
@@ -560,13 +672,14 @@ exit 127
                 error("Extracted agy binary missing or truncated")
             }
 
-            agyBin.parentFile?.mkdirs()
-            if (agyBin.exists()) agyBin.delete()
-            if (!tmpBin.renameTo(agyBin)) {
-                tmpBin.copyTo(agyBin, overwrite = true)
+            agyRealBin.parentFile?.mkdirs()
+            if (agyRealBin.exists()) agyRealBin.delete()
+            if (!tmpBin.renameTo(agyRealBin)) {
+                tmpBin.copyTo(agyRealBin, overwrite = true)
                 tmpBin.delete()
             }
-            chmod755(agyBin)
+            chmod755(agyRealBin)
+            ensureAgyWrapper()
             agyVersionFile.writeText(version)
             migrateTermuxCredentialsIfNeeded()
 
@@ -622,18 +735,17 @@ exit 127
 
             onProgress("Resolving git & nodejs-lts dependencies…", 0.50f)
             val repoBase = "https://packages.termux.dev/apt/termux-main"
-            val packagesText = httpClient.newCall(
+            val pkgIndex = httpClient.newCall(
                 Request.Builder()
                     .url("$repoBase/dists/stable/main/binary-${arch.termuxBootstrapArch}/Packages")
-                    .header("User-Agent", "AgyMobile/1.3.0")
+                    .header("User-Agent", "AgyMobile/1.5.0")
                     .get()
                     .build()
             ).execute().use { resp ->
                 if (!resp.isSuccessful) error("Termux Packages HTTP ${resp.code}")
-                resp.body?.string().orEmpty()
+                val body = resp.body ?: error("Empty Packages response")
+                parseDebianPackagesStream(body.charStream().buffered())
             }
-
-            val pkgIndex = parseDebianPackages(packagesText)
             val installed = parseInstalledDpkgPackages(File(usrDir, "var/lib/dpkg/status"))
             val toInstall = resolveDebDependencies(listOf("git", "nodejs-lts"), pkgIndex, installed)
 
@@ -647,6 +759,8 @@ exit 127
             }
 
             makeTreeExecutable(usrDir)
+            ensureAgyWrapper()
+            ensureBrowserShims()
             val shFile = File(usrDir, "bin/sh")
             if (!shFile.exists() && bashBin.exists()) {
                 runCatching { Os.symlink("bash", shFile.absolutePath) }
@@ -692,6 +806,7 @@ exit 127
                 FileOutputStream(dest).use { output ->
                     val buf = ByteArray(64 * 1024)
                     var readTotal = 0L
+                    var lastEmitMs = 0L
                     while (true) {
                         val n = input.read(buf)
                         if (n <= 0) break
@@ -699,7 +814,11 @@ exit 127
                         digest.update(buf, 0, n)
                         readTotal += n
                         if (total > 0) {
-                            onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= 100L || readTotal >= total) {
+                                lastEmitMs = now
+                                onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                            }
                         }
                     }
                 }
@@ -719,13 +838,18 @@ exit 127
                 FileOutputStream(dest).use { output ->
                     val buf = ByteArray(64 * 1024)
                     var readTotal = 0L
+                    var lastEmitMs = 0L
                     while (true) {
                         val n = input.read(buf)
                         if (n <= 0) break
                         output.write(buf, 0, n)
                         readTotal += n
                         if (total > 0) {
-                            onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= 100L || readTotal >= total) {
+                                lastEmitMs = now
+                                onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f))
+                            }
                         }
                     }
                 }
@@ -797,10 +921,14 @@ exit 127
                 val outFile = File(targetDir, entry.name)
                 if (!outFile.canonicalPath.startsWith(canonicalTarget)) continue
                 if (entry.isDirectory) {
+                    val outPath = outFile.toPath()
+                    if (Files.isSymbolicLink(outPath)) {
+                        Files.deleteIfExists(outPath)
+                    }
                     outFile.mkdirs()
                 } else {
                     outFile.parentFile?.mkdirs()
-                    if (outFile.exists()) outFile.delete()
+                    runCatching { Files.deleteIfExists(outFile.toPath()) }
                     FileOutputStream(outFile).use { out ->
                         while (true) {
                             val n = zis.read(buf)
@@ -869,14 +997,39 @@ exit 127
         val depends: List<String>
     )
 
-    private fun parseDebianPackages(raw: String): Map<String, DebPkg> {
+    private fun parseDebianPackagesStream(reader: BufferedReader): Map<String, DebPkg> {
         val map = HashMap<String, DebPkg>()
-        for (block in raw.split("\n\n")) {
-            var pkg = ""
-            var ver = ""
-            var filename = ""
-            var depsRaw = ""
-            for (line in block.lines()) {
+        var pkg = ""
+        var ver = ""
+        var filename = ""
+        var depsRaw = ""
+
+        fun flushBlock() {
+            if (pkg.isNotBlank() && filename.isNotBlank()) {
+                val deps = if (depsRaw.isBlank()) {
+                    emptyList()
+                } else {
+                    depsRaw.split(",").mapNotNull { dep ->
+                        dep.split("|").firstOrNull()
+                            ?.substringBefore("(")
+                            ?.trim()
+                            ?.takeIf { it.isNotBlank() }
+                    }
+                }
+                map[pkg] = DebPkg(pkg, ver, filename, deps)
+            }
+            pkg = ""
+            ver = ""
+            filename = ""
+            depsRaw = ""
+        }
+
+        reader.useLines { lines ->
+            for (line in lines) {
+                if (line.isBlank()) {
+                    flushBlock()
+                    continue
+                }
                 when {
                     line.startsWith("Package:") -> pkg = line.substringAfter(':').trim()
                     line.startsWith("Version:") -> ver = line.substringAfter(':').trim()
@@ -884,17 +1037,8 @@ exit 127
                     line.startsWith("Depends:") -> depsRaw = line.substringAfter(':').trim()
                 }
             }
-            if (pkg.isNotBlank() && filename.isNotBlank()) {
-                val deps = depsRaw.split(",")
-                    .mapNotNull { dep ->
-                        dep.split("|").firstOrNull()
-                            ?.substringBefore("(")
-                            ?.trim()
-                            ?.takeIf { it.isNotBlank() }
-                    }
-                map[pkg] = DebPkg(pkg, ver, filename, deps)
-            }
         }
+        flushBlock()
         return map
     }
 
@@ -1044,6 +1188,9 @@ exit 127
                         Files.createSymbolicLink(target, linkTarget)
                     }
                     Files.isDirectory(current) -> {
+                        if (Files.isSymbolicLink(target) || (Files.exists(target) && !Files.isDirectory(target))) {
+                            Files.deleteIfExists(target)
+                        }
                         Files.createDirectories(target)
                     }
                     else -> {

@@ -13,8 +13,8 @@ android {
         applicationId = "com.hambalapps.agymobile"
         minSdk = 26
         targetSdk = 28
-        versionCode = 14
-        versionName = "1.4.1"
+        versionCode = 15
+        versionName = "1.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

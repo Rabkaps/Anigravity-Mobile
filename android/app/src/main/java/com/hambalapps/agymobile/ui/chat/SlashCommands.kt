@@ -113,6 +113,14 @@ object SlashCommandCatalog {
             sheetTrigger = LocalSheetTrigger.AGENTS_MCP
         ),
         SlashCommandSpec(
+            command = "/plugin",
+            aliases = listOf("/plugins", "/marketplace", "/customizations"),
+            category = "Tools & Tasks",
+            description = "Browse Antigravity Plugin Marketplace and manage rules, skills & plugins",
+            target = SlashCommandTarget.LOCAL_SHEET,
+            sheetTrigger = LocalSheetTrigger.AGENTS_MCP
+        ),
+        SlashCommandSpec(
             command = "/hooks",
             category = "Tools & Tasks",
             description = "Inspect configured pre-flight/post-action hooks",

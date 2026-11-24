@@ -257,7 +257,10 @@ fun ChatScreen(
                                     onStartStandaloneEngine = { includeToolchain ->
                                         viewModel.startStandaloneEngine(includeToolchain)
                                     },
+                                    onUpdateStandaloneAgy = viewModel::updateStandaloneAgy,
                                     onInstallToolchain = viewModel::installStandaloneToolchain,
+                                    onOpenAuth = { viewModel.openSheet(ActiveSheet.AUTH) },
+                                    onOpenMarketplace = { viewModel.openSheet(ActiveSheet.AGENTS_MCP) },
                                     onAutoSetupBridge = viewModel::autoSetupAndStartBridge,
                                     onOpenTerminal = viewModel::openTerminalSheet,
                                     onOpenSettings = { viewModel.openSheet(ActiveSheet.SETTINGS) }
@@ -340,7 +343,15 @@ fun ChatScreen(
             onSubmitGeminiApiKey = viewModel::submitGeminiApiKey,
             onOpenTerminalLogin = viewModel::openTerminalForAuth,
             onRetryHandshake = viewModel::retryAcpHandshake,
-            onDismiss = viewModel::closeSheet
+            onDismiss = viewModel::closeSheet,
+            isStandalone = state.activeProfile?.isStandalone ?: true,
+            standaloneToolchainInstalled = state.standaloneToolchainInstalled,
+            googleLoginState = state.googleLoginState,
+            onStartGuidedGoogleLogin = viewModel::startGuidedGoogleLogin,
+            onSubmitGoogleAuthCode = viewModel::submitGoogleAuthCode,
+            onCancelGuidedGoogleLogin = viewModel::cancelGuidedGoogleLogin,
+            onOpenBrowserUrl = { url -> viewModel.openUrlInBrowser(url, force = true) },
+            onInstallToolchain = viewModel::installStandaloneToolchain
         )
         ActiveSheet.MODE_MODEL -> ModeAndModelSheet(
             configOptions = state.configOptions,
@@ -380,7 +391,25 @@ fun ChatScreen(
                 viewModel.closeSheet()
                 viewModel.openTerminalWithCommand("agy agents")
             },
-            onDismiss = viewModel::closeSheet
+            onDismiss = viewModel::closeSheet,
+            isStandalone = state.activeProfile?.isStandalone ?: true,
+            standaloneToolchainInstalled = state.standaloneToolchainInstalled,
+            marketplaceCatalog = state.marketplaceCatalog,
+            installedPlugins = state.installedPlugins,
+            isLoadingPlugins = state.isLoadingPlugins,
+            pluginActionTarget = state.pluginActionTarget,
+            pluginStatusMessage = state.pluginStatusMessage,
+            globalRulesText = state.globalRulesText,
+            workspaceRulesText = state.workspaceRulesText,
+            discoveredSkills = state.discoveredSkills,
+            onRefreshPlugins = viewModel::refreshMarketplaceAndPlugins,
+            onInstallPlugin = viewModel::installPlugin,
+            onTogglePlugin = viewModel::setPluginEnabled,
+            onUninstallPlugin = viewModel::uninstallPlugin,
+            onSaveRules = viewModel::saveRules,
+            onSaveSkill = viewModel::createOrSaveSkill,
+            onUpdateCliSettingBoolean = viewModel::updateCliSettingBoolean,
+            onInstallToolchain = viewModel::installStandaloneToolchain
         )
         ActiveSheet.TERMINAL -> TerminalSheet(
             ptyClient = viewModel.ptyClient,
@@ -389,7 +418,11 @@ fun ChatScreen(
             onConsumedPendingCommand = viewModel::clearTerminalPendingCommand,
             onDoneAuthReconnect = viewModel::finishTerminalAuthAndReconnect,
             onOpenUrl = viewModel::openUrlInBrowser,
-            onDismiss = viewModel::closeSheet
+            onDismiss = viewModel::closeSheet,
+            isStandalone = state.activeProfile?.isStandalone ?: false,
+            standaloneToolchainInstalled = state.standaloneToolchainInstalled,
+            onUpdateStandaloneAgy = viewModel::updateStandaloneAgy,
+            onInstallToolchain = viewModel::installStandaloneToolchain
         )
         ActiveSheet.SETTINGS -> ConnectionSettingsSheet(
             preferences = state.preferences,
@@ -403,6 +436,7 @@ fun ChatScreen(
             onStartStandaloneEngine = { includeToolchain ->
                 viewModel.startStandaloneEngine(includeToolchain)
             },
+            onUpdateStandaloneAgy = viewModel::updateStandaloneAgy,
             onInstallToolchain = viewModel::installStandaloneToolchain,
             onAutoSetupBridge = viewModel::autoSetupAndStartBridge,
             onSaveProfile = viewModel::saveProfile,
@@ -538,7 +572,10 @@ internal fun EmptyChatHero(
     state: ChatUiState,
     onQuickPrompt: (String) -> Unit,
     onStartStandaloneEngine: (includeToolchain: Boolean) -> Unit = {},
+    onUpdateStandaloneAgy: () -> Unit = {},
     onInstallToolchain: () -> Unit = {},
+    onOpenAuth: () -> Unit = {},
+    onOpenMarketplace: () -> Unit = {},
     onAutoSetupBridge: (useRootSu: Boolean) -> Unit,
     onOpenTerminal: () -> Unit,
     onOpenSettings: () -> Unit
@@ -579,7 +616,11 @@ internal fun EmptyChatHero(
         )
         Spacer(Modifier.height(16.dp))
 
-        if (state.connectionState != BridgeConnectionState.CONNECTED || state.isBootstrapping) {
+        val showSetupChecklist = state.connectionState != BridgeConnectionState.CONNECTED ||
+            state.isBootstrapping ||
+            (state.activeProfile?.isStandalone == true && (!state.standaloneSignedIn || !state.standaloneToolchainInstalled))
+
+        if (showSetupChecklist) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = M3ExpressiveShape.ExtraLarge,
@@ -594,7 +635,7 @@ internal fun EmptyChatHero(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "Standalone Built-In Engine",
+                        text = "Standalone Setup & Status",
                         style = MaterialTheme.typography.titleMedium
                     )
                     Text(
@@ -633,20 +674,56 @@ internal fun EmptyChatHero(
                         )
                     }
 
-                    Button(
-                        onClick = { onStartStandaloneEngine(false) },
-                        enabled = !state.isBootstrapping,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .defaultMinSize(minHeight = 48.dp),
-                        shape = M3ExpressiveShape.Full
-                    ) {
-                        Text(
-                            if (state.standaloneInstalled) "Start Standalone Engine"
-                            else "Install & Start Standalone Engine"
-                        )
+                    // Step 1: Standalone Engine
+                    if (state.connectionState != BridgeConnectionState.CONNECTED) {
+                        Button(
+                            onClick = { onStartStandaloneEngine(false) },
+                            enabled = !state.isBootstrapping,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 48.dp),
+                            shape = M3ExpressiveShape.Full
+                        ) {
+                            Text(
+                                if (state.standaloneInstalled) "Start Standalone Engine"
+                                else "1. Install & Start Standalone Engine"
+                            )
+                        }
+                    } else if (state.standaloneInstalled) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "1. Engine: agy ${state.standaloneAgyVersion ?: "installed"}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            TextButton(
+                                onClick = onUpdateStandaloneAgy,
+                                enabled = !state.isBootstrapping
+                            ) {
+                                Text("Update")
+                            }
+                        }
                     }
 
+                    // Step 2: Sign in with Google
+                    if (state.activeProfile?.isStandalone == true && !state.standaloneSignedIn) {
+                        Button(
+                            onClick = onOpenAuth,
+                            enabled = !state.isBootstrapping,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 48.dp),
+                            shape = M3ExpressiveShape.Full
+                        ) {
+                            Text("2. Sign in with Google (Guided)")
+                        }
+                    }
+
+                    // Step 3: Optional Git & Node/NPM Toolchain
                     if (!state.standaloneToolchainInstalled) {
                         FilledTonalButton(
                             onClick = {
@@ -659,7 +736,7 @@ internal fun EmptyChatHero(
                                 .defaultMinSize(minHeight = 48.dp),
                             shape = M3ExpressiveShape.Full
                         ) {
-                            Text("Install Git & Node/NPM Toolchain")
+                            Text("3. Install Git & Node/NPM (Recommended)")
                         }
                     }
 
@@ -735,6 +812,10 @@ internal fun EmptyChatHero(
             AssistChip(
                 onClick = { onQuickPrompt("/plan ") },
                 label = { Text("/plan") }
+            )
+            AssistChip(
+                onClick = onOpenMarketplace,
+                label = { Text("Marketplace (/plugin)") }
             )
             AssistChip(
                 onClick = onOpenTerminal,
