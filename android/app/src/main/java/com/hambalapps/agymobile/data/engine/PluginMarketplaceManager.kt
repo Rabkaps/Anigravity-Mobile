@@ -294,7 +294,8 @@ class PluginMarketplaceManager(
         val list = ArrayList<InstalledPluginInfo>(arr.length())
         for (i in 0 until arr.length()) {
             val obj = arr.optJSONObject(i) ?: continue
-            val name = obj.optString("name").ifBlank { continue }
+            val name = obj.optString("name")
+            if (name.isBlank()) continue
             val path = obj.optString("path")
             val dirName = path.trimEnd('/').substringAfterLast('/').ifBlank { name }
             list.add(
