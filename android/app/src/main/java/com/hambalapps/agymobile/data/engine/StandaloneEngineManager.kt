@@ -25,8 +25,10 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URI
 import java.net.URLDecoder
 import java.nio.file.Files
 import java.security.KeyStore
@@ -265,6 +267,16 @@ class StandaloneEngineManager(
         if (browserPort > 0) {
             env["AGY_BROWSER_PORT"] = browserPort.toString()
         }
+        val proxyPort = startLocalProxyServer()
+        if (proxyPort > 0 && System.getenv("HTTPS_PROXY").isNullOrBlank()) {
+            val proxyUrl = "http://127.0.0.1:$proxyPort"
+            env["HTTP_PROXY"] = proxyUrl
+            env["HTTPS_PROXY"] = proxyUrl
+            env["http_proxy"] = proxyUrl
+            env["https_proxy"] = proxyUrl
+            env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+            env["no_proxy"] = "127.0.0.1,localhost,::1"
+        }
         ensureBrowserShims()
         ensureAgyWrapper()
         env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
@@ -300,6 +312,8 @@ class StandaloneEngineManager(
 
     private val localBrowserPort = AtomicInteger(-1)
     private var localBrowserServer: ServerSocket? = null
+    private val localProxyPort = AtomicInteger(-1)
+    private var localProxyServer: ServerSocket? = null
     @Volatile
     private var browserSpoolThreadStarted = false
 
@@ -381,6 +395,167 @@ class StandaloneEngineManager(
             }
             port
         }.getOrDefault(-1)
+    }
+
+    /**
+     * Local HTTP CONNECT tunnel that resolves hostnames via Android's system DNS (`netd`),
+     * preventing Go's pure-Go DNS resolver from failing on `[::1]:53` when `/etc/resolv.conf` is absent.
+     */
+    @Synchronized
+    fun startLocalProxyServer(): Int {
+        val existing = localProxyPort.get()
+        if (existing > 0 && localProxyServer?.isClosed == false) return existing
+
+        return runCatching {
+            val server = ServerSocket(0, 32, InetAddress.getByName("127.0.0.1"))
+            localProxyServer = server
+            val port = server.localPort
+            localProxyPort.set(port)
+            Thread({
+                while (!server.isClosed) {
+                    runCatching {
+                        val sock = server.accept()
+                        Thread({ runCatching { handleProxyClient(sock) } }, "AgyProxyReq").apply {
+                            isDaemon = true
+                            start()
+                        }
+                    }
+                }
+            }, "AgyProxyBridge").apply {
+                isDaemon = true
+                start()
+            }
+            port
+        }.getOrDefault(-1)
+    }
+
+    private fun handleProxyClient(client: Socket) {
+        client.use { cSock ->
+            cSock.soTimeout = 30_000
+            val inp = cSock.getInputStream()
+            val out = cSock.getOutputStream()
+
+            val headerBytes = ByteArrayOutputStream()
+            var prev3 = 0
+            var prev2 = 0
+            var prev1 = 0
+            while (headerBytes.size() < 65_536) {
+                val b = inp.read()
+                if (b < 0) return
+                headerBytes.write(b)
+                if (prev3 == '\r'.code && prev2 == '\n'.code && prev1 == '\r'.code && b == '\n'.code) break
+                prev3 = prev2
+                prev2 = prev1
+                prev1 = b
+            }
+
+            val rawHeaders = headerBytes.toString(Charsets.ISO_8859_1.name())
+            val lines = rawHeaders.split("\r\n")
+            val requestLine = lines.firstOrNull()?.trim() ?: return
+            val parts = requestLine.split(" ")
+            if (parts.size < 3) return
+            val method = parts[0].uppercase()
+            val target = parts[1]
+
+            if (method == "CONNECT") {
+                val (host, port) = parseHostPort(target, 443) ?: return
+                val upstream = Socket()
+                runCatching {
+                    upstream.connect(InetSocketAddress(InetAddress.getByName(host), port), 15_000)
+                }.onFailure {
+                    out.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    return
+                }
+                upstream.use { uSock ->
+                    cSock.soTimeout = 0
+                    uSock.soTimeout = 0
+                    out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    relayBidirectional(cSock, uSock)
+                }
+            } else {
+                val uri = runCatching { URI(target) }.getOrNull() ?: return
+                val host = uri.host ?: return
+                val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("https", true)) 443 else 80
+                val path = (uri.rawPath?.ifEmpty { "/" } ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
+                val upstream = Socket()
+                runCatching {
+                    upstream.connect(InetSocketAddress(InetAddress.getByName(host), port), 15_000)
+                }.onFailure {
+                    out.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    return
+                }
+                upstream.use { uSock ->
+                    cSock.soTimeout = 0
+                    uSock.soTimeout = 0
+                    val uOut = uSock.getOutputStream()
+                    val rebuilt = buildString {
+                        append("$method $path ${parts[2]}\r\n")
+                        lines.drop(1).forEach { h ->
+                            if (h.isNotEmpty() && !h.startsWith("Proxy-Connection:", ignoreCase = true)) {
+                                append("$h\r\n")
+                            }
+                        }
+                        append("\r\n")
+                    }
+                    uOut.write(rebuilt.toByteArray(Charsets.ISO_8859_1))
+                    uOut.flush()
+                    relayBidirectional(cSock, uSock)
+                }
+            }
+        }
+    }
+
+    private fun parseHostPort(hostPort: String, defaultPort: Int): Pair<String, Int>? {
+        val trimmed = hostPort.trim()
+        if (trimmed.startsWith("[")) {
+            val closeIdx = trimmed.indexOf(']')
+            if (closeIdx <= 1) return null
+            val host = trimmed.substring(1, closeIdx)
+            val port = trimmed.substring(closeIdx + 1).removePrefix(":").toIntOrNull() ?: defaultPort
+            return host to port
+        }
+        val colonIdx = trimmed.lastIndexOf(':')
+        return if (colonIdx > 0) {
+            val host = trimmed.substring(0, colonIdx)
+            val port = trimmed.substring(colonIdx + 1).toIntOrNull() ?: defaultPort
+            host to port
+        } else {
+            trimmed to defaultPort
+        }
+    }
+
+    private fun relayBidirectional(a: Socket, b: Socket) {
+        val t1 = Thread({
+            runCatching {
+                val buf = ByteArray(16 * 1024)
+                val inp = a.getInputStream()
+                val out = b.getOutputStream()
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    out.flush()
+                }
+            }
+            runCatching { b.shutdownOutput() }
+        }, "AgyProxyUp").apply { isDaemon = true; start() }
+
+        runCatching {
+            val buf = ByteArray(16 * 1024)
+            val inp = b.getInputStream()
+            val out = a.getOutputStream()
+            while (true) {
+                val n = inp.read(buf)
+                if (n <= 0) break
+                out.write(buf, 0, n)
+                out.flush()
+            }
+        }
+        runCatching { a.shutdownOutput() }
+        runCatching { t1.join(2_000L) }
     }
 
     private fun handleBrowserClient(socket: Socket) {
