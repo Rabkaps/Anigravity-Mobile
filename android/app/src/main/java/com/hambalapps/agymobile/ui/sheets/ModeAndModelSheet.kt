@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -59,7 +60,9 @@ fun ModeAndModelSheet(
     onSelectPermissionPolicy: (String) -> Unit = {},
     onSetConfigOption: (configId: String, value: String) -> Unit,
     onOpenAuth: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    isSignedIn: Boolean = false,
+    onLogout: () -> Unit = {}
 ) {
     val contextRatio = if (maxTokens > 0) (usedTokens.toFloat() / maxTokens).coerceIn(0f, 1f) else 0f
     val animatedContext by animateFloatAsState(
@@ -193,6 +196,28 @@ fun ModeAndModelSheet(
                         quotaLookup = quotaLookup,
                         onSelect = { value -> onSetConfigOption(option.id, value) }
                     )
+                }
+            }
+
+            if (isSignedIn) {
+                OutlinedButton(
+                    onClick = {
+                        onDismiss()
+                        onLogout()
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp),
+                    shape = M3ExpressiveShape.Full
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Rounded.Logout,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text("Log Out (/logout)", color = MaterialTheme.colorScheme.error)
                 }
             }
         }

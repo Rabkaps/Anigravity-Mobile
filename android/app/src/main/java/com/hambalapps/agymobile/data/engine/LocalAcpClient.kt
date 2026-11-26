@@ -59,6 +59,7 @@ class LocalAcpClient(
     private var proc: Process? = null
     private var stdinWriter: BufferedWriter? = null
     private var activeCwd: String = engineManager.homeDir.absolutePath
+    private var activeExtraDirs: List<String> = emptyList()
     private val envOverrides = ConcurrentHashMap<String, String>()
 
     fun setEnvOverrides(patch: Map<String, String>) {
@@ -67,7 +68,7 @@ class LocalAcpClient(
         }
     }
 
-    fun start(cwd: String? = null) {
+    fun start(cwd: String? = null, extraDirs: List<String> = activeExtraDirs) {
         disconnect()
         if (!engineManager.isAgyInstalled()) {
             _connectionState.value = BridgeConnectionState.DISCONNECTED
@@ -77,11 +78,21 @@ class LocalAcpClient(
         val targetDir = cwd?.takeIf { it.isNotBlank() && File(it).exists() }?.let(::File)
             ?: engineManager.homeDir.also { it.mkdirs() }
         activeCwd = targetDir.absolutePath
+        activeExtraDirs = extraDirs.map { it.trim() }.filter { it.isNotBlank() }.distinct()
         _connectionState.value = BridgeConnectionState.CONNECTING
 
         scope.launch {
             runCatching {
-                val cmd = engineManager.buildAgyCommand(listOf("acp"))
+                val acpArgs = buildList {
+                    add("acp")
+                    activeExtraDirs.forEach { dir ->
+                        if (File(dir).exists()) {
+                            add("--add-dir")
+                            add(dir)
+                        }
+                    }
+                }
+                val cmd = engineManager.buildAgyCommand(acpArgs)
                 val pb = ProcessBuilder(cmd)
                     .directory(targetDir)
                     .redirectErrorStream(false)

@@ -44,6 +44,14 @@ data class ConnectionProfile(
     }
 }
 
+@Serializable
+data class LocalProject(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val rootDir: String,
+    val extraDirs: List<String> = emptyList()
+)
+
 data class AppPreferences(
     val profiles: List<ConnectionProfile>,
     val activeProfileId: String,
@@ -53,10 +61,15 @@ data class AppPreferences(
     val selectedEffort: String,
     val selectedMode: String,
     val permissionPolicy: String = "request_review",
-    val geminiApiKey: String = ""
+    val geminiApiKey: String = "",
+    val projects: List<LocalProject> = emptyList(),
+    val activeProjectId: String = ""
 ) {
     val activeProfile: ConnectionProfile
         get() = profiles.firstOrNull { it.id == activeProfileId } ?: profiles.first()
+
+    val activeProject: LocalProject?
+        get() = projects.firstOrNull { it.id == activeProjectId } ?: projects.firstOrNull()
 }
 
 class SettingsRepository(private val context: Context) {
@@ -72,9 +85,16 @@ class SettingsRepository(private val context: Context) {
         val SELECTED_MODE = stringPreferencesKey("selected_mode")
         val PERMISSION_POLICY = stringPreferencesKey("permission_policy")
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
+        val PROJECTS = stringPreferencesKey("local_projects_json")
+        val ACTIVE_PROJECT_ID = stringPreferencesKey("active_project_id")
     }
 
     private val standaloneDefaultCwd = "${context.filesDir.absolutePath}/engine/home"
+    private val defaultProject = LocalProject(
+        id = "default-project",
+        name = "Default Workspace",
+        rootDir = standaloneDefaultCwd
+    )
 
     private val defaultStandaloneProfile = ConnectionProfile(
         id = "local-standalone",
@@ -116,6 +136,10 @@ class SettingsRepository(private val context: Context) {
         }
 
         val activeId = prefs[Keys.ACTIVE_PROFILE_ID] ?: decodedProfiles.first().id
+        val decodedProjects = prefs[Keys.PROJECTS]?.let { raw ->
+            runCatching { json.decodeFromString<List<LocalProject>>(raw) }.getOrNull()
+        }?.takeIf { it.isNotEmpty() } ?: listOf(defaultProject)
+        val activeProjId = prefs[Keys.ACTIVE_PROJECT_ID] ?: decodedProjects.first().id
         AppPreferences(
             profiles = decodedProfiles,
             activeProfileId = activeId,
@@ -125,7 +149,9 @@ class SettingsRepository(private val context: Context) {
             selectedEffort = prefs[Keys.SELECTED_EFFORT] ?: "medium",
             selectedMode = prefs[Keys.SELECTED_MODE] ?: "default",
             permissionPolicy = prefs[Keys.PERMISSION_POLICY] ?: "request_review",
-            geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: ""
+            geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: "",
+            projects = decodedProjects,
+            activeProjectId = activeProjId
         )
     }
 
@@ -193,5 +219,39 @@ class SettingsRepository(private val context: Context) {
             if (apiKey.isBlank()) prefs.remove(Keys.GEMINI_API_KEY)
             else prefs[Keys.GEMINI_API_KEY] = apiKey.trim()
         }
+    }
+
+    suspend fun saveProject(project: LocalProject, setActive: Boolean = true) {
+        context.dataStore.edit { prefs ->
+            val current = prefs[Keys.PROJECTS]?.let { raw ->
+                runCatching { json.decodeFromString<List<LocalProject>>(raw) }.getOrNull()
+            }?.takeIf { it.isNotEmpty() } ?: listOf(defaultProject)
+            val updated = if (current.any { it.id == project.id }) {
+                current.map { if (it.id == project.id) project else it }
+            } else {
+                current + project
+            }
+            prefs[Keys.PROJECTS] = json.encodeToString(updated)
+            if (setActive) {
+                prefs[Keys.ACTIVE_PROJECT_ID] = project.id
+            }
+        }
+    }
+
+    suspend fun deleteProject(projectId: String) {
+        context.dataStore.edit { prefs ->
+            val current = prefs[Keys.PROJECTS]?.let { raw ->
+                runCatching { json.decodeFromString<List<LocalProject>>(raw) }.getOrNull()
+            } ?: listOf(defaultProject)
+            val filtered = current.filterNot { it.id == projectId }.ifEmpty { listOf(defaultProject) }
+            prefs[Keys.PROJECTS] = json.encodeToString(filtered)
+            if (prefs[Keys.ACTIVE_PROJECT_ID] == projectId) {
+                prefs[Keys.ACTIVE_PROJECT_ID] = filtered.first().id
+            }
+        }
+    }
+
+    suspend fun setActiveProject(projectId: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.ACTIVE_PROJECT_ID] = projectId }
     }
 }

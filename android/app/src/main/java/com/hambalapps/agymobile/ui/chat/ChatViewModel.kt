@@ -24,6 +24,7 @@ import com.hambalapps.agymobile.data.engine.ShizukuBridge
 import com.hambalapps.agymobile.data.engine.StandaloneEngineManager
 import com.hambalapps.agymobile.data.engine.StandaloneLoginRunner
 import com.hambalapps.agymobile.data.local.ConnectionProfile
+import com.hambalapps.agymobile.data.local.LocalProject
 import com.hambalapps.agymobile.data.local.SettingsRepository
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
@@ -256,6 +257,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             acpClient.disconnect()
             refreshStandaloneStatus()
             viewModelScope.launch {
+                val activeProj = _uiState.value.preferences?.activeProject
+                val resolvedCwd = activeProj?.rootDir?.takeIf { it.isNotBlank() }
+                    ?: profile.defaultCwd.ifBlank { engineManager.homeDir.absolutePath }
+                val projExtras = activeProj?.extraDirs.orEmpty()
                 if (engineManager.isAgyInstalled()) {
                     engineManager.migrateTermuxCredentialsIfNeeded()
                     val priv = engineManager.detectPrivilegeLevel()
@@ -272,10 +277,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 privilegeLevel = priv,
                                 defaultWorkspace = engineManager.homeDir.absolutePath
                             ),
-                            workspaceCwd = profile.defaultCwd.ifBlank { engineManager.homeDir.absolutePath }
+                            workspaceCwd = resolvedCwd,
+                            extraDirs = projExtras
                         )
                     }
-                    localAcpClient.start(profile.defaultCwd.ifBlank { engineManager.homeDir.absolutePath })
+                    localAcpClient.start(resolvedCwd, projExtras)
                 } else {
                     localAcpClient.disconnect()
                     _uiState.update {
@@ -967,16 +973,89 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addWorkspaceDir(dirPath: String) {
+        val trimmed = dirPath.trim()
+        if (trimmed.isEmpty()) return
         _uiState.update { state ->
-            if (dirPath in state.extraDirs) state
+            if (trimmed in state.extraDirs) state
             else state.copy(
-                extraDirs = state.extraDirs + dirPath,
+                extraDirs = state.extraDirs + trimmed,
                 messages = state.messages + ChatMessageUi(
                     role = MessageRole.SYSTEM,
-                    text = "Added workspace directory: $dirPath"
+                    text = "Added workspace directory: $trimmed"
                 )
             )
         }
+        val activeProj = _uiState.value.preferences?.activeProject
+        if (activeProj != null && trimmed !in activeProj.extraDirs) {
+            viewModelScope.launch {
+                settingsRepo.saveProject(
+                    activeProj.copy(extraDirs = activeProj.extraDirs + trimmed),
+                    setActive = true
+                )
+            }
+        }
+    }
+
+    fun saveProject(
+        name: String,
+        rootDir: String,
+        extraDirs: List<String>,
+        existingId: String? = null
+    ) {
+        val cleanName = name.trim().ifBlank { "Untitled Project" }
+        val cleanRoot = rootDir.trim().ifBlank { engineManager.homeDir.absolutePath }
+        val cleanExtras = extraDirs.map { it.trim() }.filter { it.isNotBlank() && it != cleanRoot }.distinct()
+        val project = if (existingId != null) {
+            LocalProject(id = existingId, name = cleanName, rootDir = cleanRoot, extraDirs = cleanExtras)
+        } else {
+            LocalProject(name = cleanName, rootDir = cleanRoot, extraDirs = cleanExtras)
+        }
+        viewModelScope.launch {
+            runCatching { java.io.File(cleanRoot).mkdirs() }
+            settingsRepo.saveProject(project, setActive = true)
+            switchToProject(project)
+        }
+    }
+
+    fun selectProject(projectId: String) {
+        val project = _uiState.value.preferences?.projects?.firstOrNull { it.id == projectId } ?: return
+        viewModelScope.launch {
+            settingsRepo.setActiveProject(projectId)
+            switchToProject(project)
+        }
+    }
+
+    fun deleteProject(projectId: String) {
+        viewModelScope.launch {
+            settingsRepo.deleteProject(projectId)
+        }
+    }
+
+    private suspend fun switchToProject(project: LocalProject) {
+        activeAgentMessageId = null
+        activeUserMessageId = null
+        _uiState.update {
+            it.copy(
+                workspaceCwd = project.rootDir,
+                extraDirs = project.extraDirs,
+                messages = listOf(
+                    ChatMessageUi(
+                        role = MessageRole.SYSTEM,
+                        text = "Switched to project \"${project.name}\" (${project.rootDir})"
+                    )
+                ),
+                activeSubagents = emptyList(),
+                isStreaming = false,
+                usedTokens = 0,
+                statusBanner = null
+            )
+        }
+        if (isStandaloneActive()) {
+            localAcpClient.start(project.rootDir, project.extraDirs)
+        } else {
+            runCatching { createNewSession(cwdOverride = project.rootDir) }
+        }
+        refreshSessions()
     }
 
     fun openSheet(sheet: ActiveSheet) {

@@ -152,7 +152,14 @@ fun ChatScreen(
                 onLoadSession = viewModel::loadSavedSession,
                 onOpenSheet = viewModel::openSheet,
                 onOpenTerminal = viewModel::openTerminalSheet,
-                onCloseDrawer = { scope.launch { drawerState.close() } }
+                onCloseDrawer = { scope.launch { drawerState.close() } },
+                isSignedIn = state.standaloneSignedIn || state.sessionId != null,
+                onLogout = viewModel::logoutFromAgent,
+                projects = state.preferences?.projects.orEmpty(),
+                activeProjectId = state.preferences?.activeProjectId,
+                onSelectProject = viewModel::selectProject,
+                onSaveProject = viewModel::saveProject,
+                onDeleteProject = viewModel::deleteProject
             )
         }
     ) {
@@ -351,7 +358,9 @@ fun ChatScreen(
             onSubmitGoogleAuthCode = viewModel::submitGoogleAuthCode,
             onCancelGuidedGoogleLogin = viewModel::cancelGuidedGoogleLogin,
             onOpenBrowserUrl = { url -> viewModel.openUrlInBrowser(url, force = true) },
-            onInstallToolchain = viewModel::installStandaloneToolchain
+            onInstallToolchain = viewModel::installStandaloneToolchain,
+            isSignedIn = state.standaloneSignedIn || state.sessionId != null,
+            onLogout = viewModel::logoutFromAgent
         )
         ActiveSheet.MODE_MODEL -> ModeAndModelSheet(
             configOptions = state.configOptions,
@@ -365,7 +374,9 @@ fun ChatScreen(
             onSelectPermissionPolicy = viewModel::setPermissionPolicy,
             onSetConfigOption = viewModel::setConfigOption,
             onOpenAuth = { viewModel.openSheet(ActiveSheet.AUTH) },
-            onDismiss = viewModel::closeSheet
+            onDismiss = viewModel::closeSheet,
+            isSignedIn = state.standaloneSignedIn || state.sessionId != null,
+            onLogout = viewModel::logoutFromAgent
         )
         ActiveSheet.DIFF -> DiffViewerSheet(
             files = state.diffFiles,

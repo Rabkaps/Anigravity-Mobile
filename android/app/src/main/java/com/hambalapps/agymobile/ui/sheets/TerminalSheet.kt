@@ -154,6 +154,7 @@ fun TerminalSheet(
                     }
                     listOf(
                         "Google Login" to "SSH_CONNECTION='127.0.0.1 22 127.0.0.1 22' agy acp --login",
+                        "Remote Agents" to "agy --remote-agent",
                         "agy plugin list" to "agy plugin list",
                         "agy --version" to "agy --version",
                         "rish -c id" to "rish -c id",

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.ExpandLess
@@ -72,7 +73,9 @@ fun AuthSheet(
     onSubmitGoogleAuthCode: (String) -> Unit = {},
     onCancelGuidedGoogleLogin: () -> Unit = {},
     onOpenBrowserUrl: (String) -> Unit = {},
-    onInstallToolchain: () -> Unit = {}
+    onInstallToolchain: () -> Unit = {},
+    isSignedIn: Boolean = false,
+    onLogout: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showApiKeyInput by remember { mutableStateOf(false) }
@@ -495,6 +498,26 @@ fun AuthSheet(
                 shape = M3ExpressiveShape.Full
             ) {
                 Text("Already signed in? Retry Session")
+            }
+
+            if (isSignedIn) {
+                OutlinedButton(
+                    onClick = onLogout,
+                    enabled = !authInProgress,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp),
+                    shape = M3ExpressiveShape.Full
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Rounded.Logout,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text("Log Out & Clear Credentials", color = MaterialTheme.colorScheme.error)
+                }
             }
         }
     }
