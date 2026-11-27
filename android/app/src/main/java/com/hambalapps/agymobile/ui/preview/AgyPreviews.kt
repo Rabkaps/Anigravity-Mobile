@@ -138,7 +138,6 @@ fun ChatEmptyHeroPreview(
                     EmptyChatHero(
                         state = state,
                         onQuickPrompt = {},
-                        onAutoSetupBridge = {},
                         onOpenTerminal = {},
                         onOpenSettings = {}
                     )
@@ -212,7 +211,6 @@ fun SolarDynamicThemePreview(
                     EmptyChatHero(
                         state = state,
                         onQuickPrompt = {},
-                        onAutoSetupBridge = {},
                         onOpenTerminal = {},
                         onOpenSettings = {}
                     )

@@ -55,7 +55,6 @@ fun ConnectionSettingsSheet(
     onStartStandaloneEngine: (includeToolchain: Boolean) -> Unit = {},
     onUpdateStandaloneAgy: () -> Unit = {},
     onInstallToolchain: () -> Unit = {},
-    onAutoSetupBridge: (useRootSu: Boolean) -> Unit,
     onSaveProfile: (ConnectionProfile) -> Unit,
     onDeleteProfile: (String) -> Unit,
     onSelectProfile: (String) -> Unit,
@@ -72,7 +71,7 @@ fun ConnectionSettingsSheet(
     var portText by remember(active?.id) { mutableStateOf((active?.port ?: 4789).toString()) }
     var token by remember(active?.id) { mutableStateOf(active?.token ?: "") }
     var defaultCwd by remember(active?.id) {
-        mutableStateOf(active?.defaultCwd ?: "/data/data/com.termux/files/home")
+        mutableStateOf(active?.defaultCwd ?: "")
     }
     var useTls by remember(active?.id) { mutableStateOf(active?.useTls ?: false) }
     var isRemote by remember(active?.id) { mutableStateOf(active?.isRemote ?: false) }
@@ -87,7 +86,7 @@ fun ConnectionSettingsSheet(
         useTls = useTls,
         isRemote = isRemote,
         isStandalone = isStandalone,
-        defaultCwd = defaultCwd.ifBlank { "/data/data/com.termux/files/home" }
+        defaultCwd = defaultCwd.ifBlank { "/storage/emulated/0" }
     )
 
     ModalBottomSheet(
@@ -191,31 +190,6 @@ fun ConnectionSettingsSheet(
                             shape = M3ExpressiveShape.Full
                         ) {
                             Text("Check & Update agy CLI")
-                        }
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = { onAutoSetupBridge(false) },
-                            enabled = !isBootstrapping,
-                            modifier = Modifier
-                                .weight(1f)
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.groupLeftShape
-                        ) {
-                            Text("Start via Termux")
-                        }
-                        OutlinedButton(
-                            onClick = { onAutoSetupBridge(true) },
-                            enabled = !isBootstrapping,
-                            modifier = Modifier
-                                .weight(1f)
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.groupRightShape
-                        ) {
-                            Text("Zero-Touch (su)")
                         }
                     }
                 }

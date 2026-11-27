@@ -26,7 +26,7 @@ data class ConnectionProfile(
     val useTls: Boolean = false,
     val isRemote: Boolean = false,
     val isStandalone: Boolean = false,
-    val defaultCwd: String = "/data/data/com.termux/files/home"
+    val defaultCwd: String = ""
 ) {
     fun httpBaseUrl(): String {
         val scheme = if (useTls) "https" else "http"
@@ -111,24 +111,13 @@ class SettingsRepository(private val context: Context) {
     )
 
     private val defaultProfiles = listOf(
-        defaultStandaloneProfile,
-        ConnectionProfile(
-            id = "local-termux",
-            name = "On-Device Termux",
-            host = "127.0.0.1",
-            port = 4789,
-            token = "",
-            useTls = false,
-            isRemote = false,
-            isStandalone = false,
-            defaultCwd = "/data/data/com.termux/files/home"
-        )
+        defaultStandaloneProfile
     )
 
     val preferencesFlow: Flow<AppPreferences> = context.dataStore.data.map { prefs ->
         val decoded = prefs[Keys.PROFILES]?.let { raw ->
             runCatching { json.decodeFromString<List<ConnectionProfile>>(raw) }.getOrNull()
-        }?.takeIf { it.isNotEmpty() }
+        }?.filterNot { it.id == "local-termux" }?.takeIf { it.isNotEmpty() }
 
         val decodedProfiles = when {
             decoded == null -> defaultProfiles
@@ -137,7 +126,12 @@ class SettingsRepository(private val context: Context) {
             else -> decoded
         }
 
-        val activeId = prefs[Keys.ACTIVE_PROFILE_ID] ?: decodedProfiles.first().id
+        val rawActiveId = prefs[Keys.ACTIVE_PROFILE_ID]
+        val activeId = if (rawActiveId.isNullOrBlank() || rawActiveId == "local-termux") {
+            decodedProfiles.first().id
+        } else {
+            rawActiveId
+        }
         val decodedProjects = prefs[Keys.PROJECTS]?.let { raw ->
             runCatching { json.decodeFromString<List<LocalProject>>(raw) }.getOrNull()
         }?.takeIf { it.isNotEmpty() } ?: listOf(defaultProject)

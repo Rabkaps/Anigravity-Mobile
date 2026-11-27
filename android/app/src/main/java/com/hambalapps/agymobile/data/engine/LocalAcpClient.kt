@@ -308,6 +308,7 @@ class LocalAcpClient(
         if (existingAgy?.containsKey("systemPrompt") == true) return params
 
         val privilegeLevel = engineManager.detectPrivilegeLevel()
+        engineManager.ensureMobileEnvRules(privilegeLevel)
         val contextPrompt = engineManager.buildDeviceContextPrompt(privilegeLevel)
 
         val mergedAgy = buildJsonObject {

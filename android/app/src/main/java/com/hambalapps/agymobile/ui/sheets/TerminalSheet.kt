@@ -40,7 +40,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
-import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 import com.hambalapps.agymobile.ui.theme.MonoCodeStyle
 import kotlinx.coroutines.delay
@@ -170,7 +169,6 @@ fun TerminalSheet(
                     }
                 } else {
                     listOf(
-                        "Install agy CLI" to TermuxBridgeBootstrap.AGY_TERMUX_INSTALL_CMD,
                         "agy acp --login" to "SSH_CONNECTION='127.0.0.1 22 127.0.0.1 22' agy acp --login",
                         "agy --version" to "agy --version",
                         "su -c id" to "su -c id",

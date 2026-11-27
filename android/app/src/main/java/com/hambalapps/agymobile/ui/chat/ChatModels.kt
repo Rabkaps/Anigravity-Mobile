@@ -44,6 +44,17 @@ data class ArtifactUi(
     val approved: Boolean? = null
 )
 
+data class PendingAttachmentUi(
+    val id: String = UUID.randomUUID().toString(),
+    val displayName: String,
+    val mimeType: String,
+    val isImage: Boolean,
+    val localPath: String? = null,
+    val base64Data: String? = null,
+    val textContent: String? = null,
+    val sizeBytes: Long = 0L
+)
+
 data class ChatMessageUi(
     val id: String = UUID.randomUUID().toString(),
     val role: MessageRole,
@@ -51,12 +62,14 @@ data class ChatMessageUi(
     val thinking: String = "",
     val toolCalls: List<ToolCallUi> = emptyList(),
     val planSteps: List<String> = emptyList(),
+    val attachmentLabels: List<String> = emptyList(),
     val isStreaming: Boolean = false
 )
 
 data class QueuedMessageUi(
     val id: String = UUID.randomUUID().toString(),
-    val text: String
+    val text: String,
+    val attachments: List<PendingAttachmentUi> = emptyList()
 )
 
 enum class ActiveSheet {
@@ -82,10 +95,11 @@ data class ChatUiState(
     val statusBanner: String? = null,
     val pendingBrowserUrl: String? = null,
     val sessionId: String? = null,
-    val workspaceCwd: String = "/data/data/com.termux/files/home",
+    val workspaceCwd: String = "",
     val extraDirs: List<String> = emptyList(),
     val messages: List<ChatMessageUi> = emptyList(),
     val composerText: String = "",
+    val pendingAttachments: List<PendingAttachmentUi> = emptyList(),
     val queuedMessages: List<QueuedMessageUi> = emptyList(),
     val isStreaming: Boolean = false,
     val configOptions: List<AcpConfigOption> = emptyList(),
@@ -106,8 +120,6 @@ data class ChatUiState(
     val connectionTestResult: String? = null,
     val isBootstrapping: Boolean = false,
     val bootstrapStatus: String? = null,
-    val termuxInstalled: Boolean = false,
-    val hasTermuxPermission: Boolean = false,
     val quotaSummary: QuotaSummaryResponse? = null,
     val isLoadingQuota: Boolean = false,
     val standaloneInstalled: Boolean = false,

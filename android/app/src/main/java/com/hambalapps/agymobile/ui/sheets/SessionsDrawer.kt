@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,12 +16,16 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
@@ -35,6 +40,8 @@ import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
@@ -64,10 +71,18 @@ import com.hambalapps.agymobile.ui.chat.ActiveSheet
 import com.hambalapps.agymobile.ui.chat.detectTextDirection
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
+import java.io.File
+
+private enum class FolderPickerTarget {
+    WORKSPACE_CWD,
+    NEW_PROJECT_ROOT,
+    NEW_PROJECT_EXTRA
+}
 
 @Composable
 fun SessionsDrawerContent(
     workspaceCwd: String,
+    engineHomePath: String = "",
     profiles: List<ConnectionProfile>,
     activeProfileId: String?,
     sessions: List<SessionSummary>,
@@ -85,7 +100,8 @@ fun SessionsDrawerContent(
     activeProjectId: String? = null,
     onSelectProject: (String) -> Unit = {},
     onSaveProject: (name: String, rootDir: String, extraDirs: List<String>, existingId: String?) -> Unit = { _, _, _, _ -> },
-    onDeleteProject: (String) -> Unit = {}
+    onDeleteProject: (String) -> Unit = {},
+    onPickSystemFolder: ((String) -> Unit) -> Unit = {}
 ) {
     var workspaceExpanded by remember { mutableStateOf(false) }
     var cwdInput by remember(workspaceCwd) { mutableStateOf(workspaceCwd) }
@@ -93,6 +109,7 @@ fun SessionsDrawerContent(
     var newProjName by remember { mutableStateOf("") }
     var newProjRoot by remember(workspaceCwd) { mutableStateOf(workspaceCwd) }
     var newProjExtras by remember { mutableStateOf("") }
+    var pickerTarget by remember { mutableStateOf<FolderPickerTarget?>(null) }
 
     val activeProject = projects.firstOrNull { it.id == activeProjectId }
     val activeWorkspaceTitle = activeProject?.name
@@ -239,18 +256,25 @@ fun SessionsDrawerContent(
                         label = { Text("Folder path") },
                         singleLine = true,
                         trailingIcon = {
-                            FilledTonalButton(
-                                onClick = {
-                                    onChangeWorkspace(cwdInput)
-                                    onCloseDrawer()
-                                },
-                                shape = M3ExpressiveShape.Full,
-                                modifier = Modifier.padding(end = 4.dp)
-                            ) {
-                                Text("Set")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = { pickerTarget = FolderPickerTarget.WORKSPACE_CWD }) {
+                                    Icon(
+                                        Icons.Rounded.FolderOpen,
+                                        contentDescription = "Browse folder"
+                                    )
+                                }
+                                FilledTonalButton(
+                                    onClick = {
+                                        onChangeWorkspace(cwdInput)
+                                        onCloseDrawer()
+                                    },
+                                    shape = M3ExpressiveShape.Full,
+                                    modifier = Modifier.padding(end = 4.dp)
+                                ) {
+                                    Text("Set")
+                                }
                             }
                         },
-                        leadingIcon = { Icon(Icons.Rounded.FolderOpen, contentDescription = null) },
                         modifier = Modifier.fillMaxWidth(),
                         shape = M3ExpressiveShape.Large
                     )
@@ -290,6 +314,14 @@ fun SessionsDrawerContent(
                                     onValueChange = { newProjRoot = it },
                                     label = { Text("Primary Folder") },
                                     singleLine = true,
+                                    trailingIcon = {
+                                        IconButton(onClick = { pickerTarget = FolderPickerTarget.NEW_PROJECT_ROOT }) {
+                                            Icon(
+                                                Icons.Rounded.FolderOpen,
+                                                contentDescription = "Browse primary folder"
+                                            )
+                                        }
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     shape = M3ExpressiveShape.Large
                                 )
@@ -299,6 +331,14 @@ fun SessionsDrawerContent(
                                     label = { Text("Extra Folders (--add-dir)") },
                                     placeholder = { Text("Optional, comma-separated") },
                                     singleLine = true,
+                                    trailingIcon = {
+                                        IconButton(onClick = { pickerTarget = FolderPickerTarget.NEW_PROJECT_EXTRA }) {
+                                            Icon(
+                                                Icons.Rounded.FolderOpen,
+                                                contentDescription = "Browse extra folder"
+                                            )
+                                        }
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     shape = M3ExpressiveShape.Large
                                 )
@@ -362,11 +402,7 @@ fun SessionsDrawerContent(
                                 },
                                 badge = {
                                     Text(
-                                        when {
-                                            profile.isStandalone -> "Local"
-                                            profile.isRemote -> "Remote"
-                                            else -> "Termux"
-                                        },
+                                        if (profile.isStandalone) "Local" else "Remote",
                                         style = MaterialTheme.typography.labelSmall
                                     )
                                 },
@@ -516,4 +552,199 @@ fun SessionsDrawerContent(
             }
         }
     }
+
+    pickerTarget?.let { target ->
+        val initialPath = when (target) {
+            FolderPickerTarget.WORKSPACE_CWD -> cwdInput.ifBlank { engineHomePath.ifBlank { "/storage/emulated/0" } }
+            FolderPickerTarget.NEW_PROJECT_ROOT -> newProjRoot.ifBlank { engineHomePath.ifBlank { "/storage/emulated/0" } }
+            FolderPickerTarget.NEW_PROJECT_EXTRA -> newProjRoot.ifBlank { engineHomePath.ifBlank { "/storage/emulated/0" } }
+        }
+        val applyPickedPath: (String) -> Unit = { picked ->
+            when (target) {
+                FolderPickerTarget.WORKSPACE_CWD -> cwdInput = picked
+                FolderPickerTarget.NEW_PROJECT_ROOT -> {
+                    newProjRoot = picked
+                    if (newProjName.isBlank()) {
+                        newProjName = picked.trimEnd('/').substringAfterLast('/').ifBlank { "Project" }
+                    }
+                }
+                FolderPickerTarget.NEW_PROJECT_EXTRA -> {
+                    val existing = newProjExtras.split(",").map { it.trim() }.filter { it.isNotBlank() }
+                    if (!existing.contains(picked)) {
+                        newProjExtras = (existing + picked).joinToString(", ")
+                    }
+                }
+            }
+        }
+        DirectoryPickerDialog(
+            initialPath = initialPath,
+            engineHomePath = engineHomePath,
+            onDismiss = { pickerTarget = null },
+            onSelect = { picked ->
+                applyPickedPath(picked)
+                pickerTarget = null
+            },
+            onOpenSystemPicker = {
+                pickerTarget = null
+                onPickSystemFolder { picked ->
+                    applyPickedPath(picked)
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun DirectoryPickerDialog(
+    initialPath: String,
+    engineHomePath: String,
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit,
+    onOpenSystemPicker: () -> Unit
+) {
+    var currentPath by remember(initialPath) {
+        val f = File(initialPath)
+        mutableStateOf(
+            when {
+                f.isDirectory -> f.absolutePath
+                f.parentFile?.isDirectory == true -> f.parentFile!!.absolutePath
+                engineHomePath.isNotBlank() && File(engineHomePath).isDirectory -> engineHomePath
+                else -> "/storage/emulated/0"
+            }
+        )
+    }
+    val currentDir = remember(currentPath) { File(currentPath) }
+    val subdirs = remember(currentPath) {
+        currentDir.listFiles()
+            ?.filter { it.isDirectory && it.canRead() }
+            ?.sortedBy { it.name.lowercase() }
+            .orEmpty()
+    }
+    val parentPath = currentDir.parentFile?.takeIf { it.canRead() }?.absolutePath
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select Folder") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (engineHomePath.isNotBlank()) {
+                        AssistChip(
+                            onClick = { currentPath = engineHomePath },
+                            label = { Text("Home") }
+                        )
+                    }
+                    AssistChip(
+                        onClick = { currentPath = "/storage/emulated/0" },
+                        label = { Text("Storage") }
+                    )
+                    AssistChip(
+                        onClick = { currentPath = "/storage/emulated/0/Download" },
+                        label = { Text("Downloads") }
+                    )
+                    AssistChip(
+                        onClick = onOpenSystemPicker,
+                        label = { Text("System Picker") }
+                    )
+                }
+
+                Surface(
+                    shape = M3ExpressiveShape.Medium,
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (parentPath != null) {
+                            IconButton(
+                                onClick = { currentPath = parentPath },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Rounded.ArrowBack,
+                                    contentDescription = "Parent folder",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = currentPath,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp, max = 280.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (subdirs.isEmpty()) {
+                        item {
+                            Text(
+                                text = "No readable subfolders",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                    } else {
+                        items(subdirs, key = { it.absolutePath }) { dir ->
+                            Surface(
+                                onClick = { currentPath = dir.absolutePath },
+                                shape = M3ExpressiveShape.Medium,
+                                color = MaterialTheme.colorScheme.surfaceContainer,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Folder,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = dir.name,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onSelect(currentPath) }) {
+                Text("Select")
+            }
+        }
+    )
 }

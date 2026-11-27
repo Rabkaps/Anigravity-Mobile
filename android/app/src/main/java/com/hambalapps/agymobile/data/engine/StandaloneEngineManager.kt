@@ -11,7 +11,6 @@ import android.os.Looper
 import android.os.Process
 import android.system.Os
 import com.hambalapps.agymobile.BuildConfig
-import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -258,6 +257,9 @@ class StandaloneEngineManager(
         if (gitTemplates.exists()) {
             env["GIT_TEMPLATE_DIR"] = gitTemplates.absolutePath
         }
+        // Prevent bundled Termux git from failing on inaccessible /data/data/com.termux/files/usr/etc/gitconfig
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_ATTR_NOSYSTEM"] = "1"
         val termInfo = File(usrDir, "share/terminfo")
         if (termInfo.exists()) {
             env["TERMINFO"] = termInfo.absolutePath
@@ -778,21 +780,29 @@ exit 1
         }
     }
 
-    private fun ensureMobileEnvRules() {
-        val geminiFile = File(homeDir, ".gemini/GEMINI.md")
+    fun ensureMobileEnvRules(privilegeLevel: String? = null) {
         val marker = "<!-- antigravity-mobile-env -->"
-        val block = """$marker
-## Android Mobile Runtime Bridge
-- `BROWSER`, `GH_BROWSER`, `xdg-open`, and `termux-open-url` are natively bridged to open URLs in the user's Android browser. **Never** override `BROWSER=true` when running interactive CLI auth flows (such as `gh auth login --web`).
-- `termux-clipboard-set`, `termux-clipboard-get`, `xclip`, `xsel`, and `wl-copy` are natively bridged to the Android clipboard.
-$marker
-"""
-        runCatching {
-            geminiFile.parentFile?.mkdirs()
-            val existing = if (geminiFile.exists()) geminiFile.readText(Charsets.UTF_8) else ""
-            if (!existing.contains(marker)) {
-                val updated = if (existing.isBlank()) block else "$existing\n\n$block"
-                geminiFile.writeText(updated, Charsets.UTF_8)
+        val contextBlock = buildDeviceContextPrompt(privilegeLevel ?: "unknown")
+        val block = "$marker\n$contextBlock\n$marker\n"
+        val targets = listOf(
+            File(homeDir, ".gemini/config/GEMINI.md"),
+            File(homeDir, ".gemini/GEMINI.md")
+        )
+        val markerRegex = Regex(
+            "${Regex.escape(marker)}[\\s\\S]*?${Regex.escape(marker)}\\r?\\n?"
+        )
+        for (geminiFile in targets) {
+            runCatching {
+                geminiFile.parentFile?.mkdirs()
+                val existing = if (geminiFile.exists()) geminiFile.readText(Charsets.UTF_8) else ""
+                val updated = when {
+                    existing.isBlank() -> block
+                    markerRegex.containsMatchIn(existing) -> existing.replace(markerRegex, block)
+                    else -> "$existing\n\n$block"
+                }
+                if (updated != existing) {
+                    geminiFile.writeText(updated, Charsets.UTF_8)
+                }
             }
         }
     }
@@ -850,6 +860,7 @@ exit 127
         val tools = buildList {
             if (bashBin.exists()) add("bash")
             if (gitBin.exists()) add("git")
+            if (File(usrDir, "bin/gh").exists()) add("gh")
             if (nodeBin.exists()) add("node")
             if (npmBin.exists()) add("npm")
             if (File(usrDir, "bin/curl").exists()) add("curl")
@@ -858,6 +869,7 @@ exit 127
         val privDesc = when (privilegeLevel) {
             "root" -> "root (`su -c ...`, uid=0)"
             "shizuku" -> "Shizuku (`rish -c ...`, uid=2000 ADB-level privileges; use `rish -c \"screencap -p ...\"` etc. for privileged Android commands)"
+            "unknown" -> "detected per session (`su -c` if rooted, `rish -c` if Shizuku is granted, otherwise app sandbox)"
             else -> if (ShizukuBridge.isBinderAlive()) {
                 "unprivileged app sandbox (Shizuku is running but permission is not granted to Agy Mobile yet)"
             } else {
@@ -865,13 +877,15 @@ exit 127
             }
         }
         return buildString {
-            appendLine("[Agy Mobile Runtime Environment]")
-            appendLine("- App: Agy Mobile (${BuildConfig.VERSION_NAME}) Standalone Engine on Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
-            appendLine("- Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} ($abi)")
-            appendLine("- Privilege backend: $privDesc")
-            appendLine("- Installed CLI tools in PATH: ${if (tools.isEmpty()) "agy only" else tools.joinToString(", ")}")
-            appendLine("- Workspace/HOME: ${homeDir.absolutePath}")
-            appendLine("- Note: `run_command` executes in the app sandbox unless prefixed with `su -c` (root) or `rish -c` (Shizuku).")
+            appendLine("## Agy Mobile Standalone Runtime Environment")
+            appendLine("- **Host App:** Agy Mobile v${BuildConfig.VERSION_NAME} built-in Standalone Engine on Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) — **NOT** Termux (`com.termux`).")
+            appendLine("- **Device:** ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} ($abi)")
+            appendLine("- **Important:** `TERMUX__*` environment variables exist only for the bundled `libtermux-exec` binary loader. Do NOT attempt to access `/data/data/com.termux/...` or assume Termux `pkg` is installed. `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1` are pre-configured for `git`.")
+            appendLine("- **Privilege backend:** $privDesc")
+            appendLine("- **Installed CLI tools in PATH:** ${if (tools.isEmpty()) "agy only" else tools.joinToString(", ")} (prefix: `${usrDir.absolutePath}`)")
+            appendLine("- **Engine HOME:** `${homeDir.absolutePath}` (shared storage: `/storage/emulated/0`)")
+            appendLine("- **Browser & Clipboard bridges:** `BROWSER`, `GH_BROWSER`, `xdg-open`, and `termux-open-url` are natively bridged to open URLs in the user's Android browser (**never** override `BROWSER=true` in interactive auth flows like `gh auth login --web`). `termux-clipboard-set`, `termux-clipboard-get`, `xclip`, `xsel`, and `wl-copy` are natively bridged to the Android clipboard.")
+            appendLine("- **Sandbox note:** `run_command` executes in the app sandbox unless prefixed with `su -c` (root) or `rish -c` (Shizuku).")
         }.trim()
     }
 
@@ -882,56 +896,6 @@ exit 127
             val code = proc.waitFor()
             code == 0 && out.contains(expectedSubstring)
         }.getOrDefault(false)
-    }
-
-    /**
-     * Copies existing Antigravity credentials & conversations from Termux if present and readable via `su`,
-     * so rooted users switching to Standalone don't need to sign in again.
-     */
-    suspend fun migrateTermuxCredentialsIfNeeded(): Boolean = withContext(Dispatchers.IO) {
-        ensureBaseDirs()
-        if (oauthTokenFile.exists()) return@withContext true
-
-        val uid = Process.myUid()
-        val dstGemini = File(homeDir, ".gemini/antigravity-cli")
-        val dstConfig = File(homeDir, ".config/antigravity")
-        dstGemini.mkdirs()
-        dstConfig.mkdirs()
-
-        val srcToken = "${TermuxBridgeBootstrap.TERMUX_HOME}/.gemini/antigravity-cli/antigravity-oauth-token"
-        val srcCred = "${TermuxBridgeBootstrap.TERMUX_HOME}/.config/antigravity/credential-user-scope"
-        val dstToken = oauthTokenFile.absolutePath
-        val dstCred = File(dstConfig, "credential-user-scope").absolutePath
-
-        val script = """
-            if [ -f '$srcToken' ]; then
-              cp -f '$srcToken' '$dstToken'
-              chown $uid:$uid '$dstToken'
-              chmod 600 '$dstToken'
-              if [ -f '$srcCred' ]; then
-                cp -f '$srcCred' '$dstCred'
-                chown $uid:$uid '$dstCred'
-                chmod 600 '$dstCred'
-              fi
-              echo MIGRATED
-            fi
-        """.trimIndent()
-
-        for (cmd in listOf(
-            listOf("su", "-t", "0", "-c", script),
-            listOf("su", "-c", script)
-        )) {
-            val res = runCatching {
-                val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
-                val out = p.inputStream.bufferedReader().readText()
-                val code = p.waitFor()
-                code == 0 && out.contains("MIGRATED")
-            }.getOrDefault(false)
-            if (res && oauthTokenFile.exists()) {
-                return@withContext true
-            }
-        }
-        false
     }
 
     fun extractBundledBridgeAssets() {
@@ -982,7 +946,6 @@ exit 127
 
             if (!forceUpdate && isAgyInstalled() && installedAgyVersion() == version) {
                 ensureAgyWrapper()
-                migrateTermuxCredentialsIfNeeded()
                 onProgress("agy $version already up to date", 1.0f)
                 return@runCatching agyBin
             }
@@ -1016,7 +979,6 @@ exit 127
             chmod755(agyRealBin)
             ensureAgyWrapper()
             agyVersionFile.writeText(version)
-            migrateTermuxCredentialsIfNeeded()
 
             onProgress("Standalone agy $version ready (${arch.abi})", 1.0f)
             agyBin

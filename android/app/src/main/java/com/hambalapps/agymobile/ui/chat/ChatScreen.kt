@@ -53,6 +53,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.rounded.Difference
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Extension
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.OpenInBrowser
@@ -111,7 +113,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.components.AntigravityHeroEmblem
 import com.hambalapps.agymobile.ui.components.AntigravityStarfieldBackground
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
@@ -136,7 +137,10 @@ import kotlinx.coroutines.launch
 fun ChatScreen(
     state: ChatUiState,
     viewModel: ChatViewModel,
-    onRequestVoice: () -> Unit
+    onRequestVoice: () -> Unit,
+    onAttachImages: () -> Unit = {},
+    onAttachFiles: () -> Unit = {},
+    onPickSystemFolder: ((String) -> Unit) -> Unit = {}
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -150,6 +154,12 @@ fun ChatScreen(
         else SlashCommandCatalog.filter(state.composerText, state.dynamicSlashCommands)
     }
 
+    LaunchedEffect(drawerState.isOpen) {
+        if (drawerState.isOpen) {
+            viewModel.refreshSessions()
+        }
+    }
+
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text?.length) {
         if (state.messages.isNotEmpty()) {
             listState.animateScrollToItem(state.messages.lastIndex)
@@ -161,6 +171,7 @@ fun ChatScreen(
         drawerContent = {
             SessionsDrawerContent(
                 workspaceCwd = state.workspaceCwd,
+                engineHomePath = viewModel.engineHomePath,
                 profiles = state.preferences?.profiles.orEmpty(),
                 activeProfileId = state.activeProfile?.id,
                 sessions = state.savedSessions,
@@ -178,7 +189,8 @@ fun ChatScreen(
                 activeProjectId = state.preferences?.activeProjectId,
                 onSelectProject = viewModel::selectProject,
                 onSaveProject = viewModel::saveProject,
-                onDeleteProject = viewModel::deleteProject
+                onDeleteProject = viewModel::deleteProject,
+                onPickSystemFolder = onPickSystemFolder
             )
         }
     ) {
@@ -305,7 +317,6 @@ fun ChatScreen(
                                     onInstallToolchain = viewModel::installStandaloneToolchain,
                                     onOpenAuth = { viewModel.openSheet(ActiveSheet.AUTH) },
                                     onOpenMarketplace = { viewModel.openSheet(ActiveSheet.AGENTS_MCP) },
-                                    onAutoSetupBridge = viewModel::autoSetupAndStartBridge,
                                     onOpenTerminal = viewModel::openTerminalSheet,
                                     onOpenSettings = { viewModel.openSheet(ActiveSheet.SETTINGS) }
                                 )
@@ -350,6 +361,9 @@ fun ChatScreen(
                             onStop = viewModel::cancelTurn,
                             onSendQueuedMessageNow = viewModel::sendQueuedMessageNow,
                             onRemoveQueuedMessage = viewModel::removeQueuedMessage,
+                            onAttachImages = onAttachImages,
+                            onAttachFiles = onAttachFiles,
+                            onRemoveAttachment = viewModel::removeAttachment,
                             onSlashTap = { viewModel.updateComposerText("/") },
                             onVoiceTap = onRequestVoice,
                             onOpenModeSheet = { viewModel.openSheet(ActiveSheet.MODE_MODEL) },
@@ -491,7 +505,6 @@ fun ChatScreen(
             },
             onUpdateStandaloneAgy = viewModel::updateStandaloneAgy,
             onInstallToolchain = viewModel::installStandaloneToolchain,
-            onAutoSetupBridge = viewModel::autoSetupAndStartBridge,
             onSaveProfile = viewModel::saveProfile,
             onDeleteProfile = viewModel::deleteProfile,
             onSelectProfile = viewModel::selectProfile,
@@ -698,7 +711,6 @@ internal fun EmptyChatHero(
     onInstallToolchain: () -> Unit = {},
     onOpenAuth: () -> Unit = {},
     onOpenMarketplace: () -> Unit = {},
-    onAutoSetupBridge: (useRootSu: Boolean) -> Unit,
     onOpenTerminal: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -904,13 +916,48 @@ internal fun MessageBubbleItem(
                     contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.widthIn(max = 312.dp)
                 ) {
-                    Text(
-                        text = message.text,
-                        style = MaterialTheme.typography.bodyLarge.copy(
-                            textDirection = detectTextDirection(message.text)
-                        ),
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                    )
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (message.attachmentLabels.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                message.attachmentLabels.forEach { label ->
+                                    Surface(
+                                        shape = M3ExpressiveShape.Medium,
+                                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.45f)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.AttachFile,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                            Text(
+                                                text = label,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Text(
+                            text = message.text,
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                textDirection = detectTextDirection(message.text)
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -1189,6 +1236,9 @@ internal fun FloatingComposerSection(
     onStop: () -> Unit,
     onSendQueuedMessageNow: (String) -> Unit = {},
     onRemoveQueuedMessage: (String) -> Unit = {},
+    onAttachImages: () -> Unit = {},
+    onAttachFiles: () -> Unit = {},
+    onRemoveAttachment: (String) -> Unit = {},
     onSlashTap: () -> Unit,
     onVoiceTap: () -> Unit,
     onOpenModeSheet: () -> Unit,
@@ -1235,6 +1285,16 @@ internal fun FloatingComposerSection(
             )
         }
         AnimatedVisibility(
+            visible = state.pendingAttachments.isNotEmpty(),
+            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+        ) {
+            PendingAttachmentsStrip(
+                attachments = state.pendingAttachments,
+                onRemove = onRemoveAttachment
+            )
+        }
+        AnimatedVisibility(
             visible = toolsExpanded,
             enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
             exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
@@ -1245,6 +1305,22 @@ internal fun FloatingComposerSection(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                ComposerToolPill(
+                    label = "Photo",
+                    icon = Icons.Rounded.Image,
+                    onClick = {
+                        toolsExpanded = false
+                        onAttachImages()
+                    }
+                )
+                ComposerToolPill(
+                    label = "File",
+                    icon = Icons.Rounded.AttachFile,
+                    onClick = {
+                        toolsExpanded = false
+                        onAttachFiles()
+                    }
+                )
                 ComposerToolPill(
                     label = "Commands /",
                     onClick = {
@@ -1361,7 +1437,8 @@ internal fun FloatingComposerSection(
                     )
                 }
 
-                if ((state.isStreaming || hasRunningTasks) && state.composerText.isNotBlank()) {
+                val canSend = state.composerText.isNotBlank() || state.pendingAttachments.isNotEmpty()
+                if ((state.isStreaming || hasRunningTasks) && canSend) {
                     FilledTonalIconButton(
                         onClick = onSend,
                         modifier = Modifier.size(48.dp)
@@ -1375,7 +1452,7 @@ internal fun FloatingComposerSection(
 
                 MorphingActionButton(
                     isStreaming = state.isStreaming || hasRunningTasks,
-                    enabled = state.composerText.isNotBlank(),
+                    enabled = canSend,
                     onSend = onSend,
                     onStop = onStop
                 )
@@ -1539,6 +1616,62 @@ private fun QueuedMessagesStrip(
                             imageVector = Icons.Rounded.Close,
                             contentDescription = "Remove queued message",
                             modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingAttachmentsStrip(
+    attachments: List<PendingAttachmentUi>,
+    onRemove: (String) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        attachments.forEach { item ->
+            Surface(
+                shape = M3ExpressiveShape.Large,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                )
+            ) {
+                Row(
+                    modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = if (item.isImage) Icons.Rounded.Image else Icons.Rounded.AttachFile,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Text(
+                        text = item.displayName,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 160.dp)
+                    )
+                    IconButton(
+                        onClick = { onRemove(item.id) },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Remove attachment",
+                            modifier = Modifier.size(14.dp),
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }

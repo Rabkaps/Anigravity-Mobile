@@ -27,7 +27,6 @@ import com.hambalapps.agymobile.data.engine.StandaloneLoginRunner
 import com.hambalapps.agymobile.data.local.ConnectionProfile
 import com.hambalapps.agymobile.data.local.LocalProject
 import com.hambalapps.agymobile.data.local.SettingsRepository
-import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -75,7 +74,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
     var onRequestVoiceInput: (() -> Unit)? = null
-    var onRequestTermuxPermission: (() -> Unit)? = null
 
     private var lastConnectedProfileKey: String? = null
     private var activeAgentMessageId: String? = null
@@ -107,7 +105,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             Shizuku.addBinderReceivedListenerSticky(shizukuBinderListener)
         }
         ShizukuBridge.requestPermissionIfNeeded()
-        refreshTermuxStatus()
         refreshStandaloneStatus()
         observePreferences()
         observeConnectionState()
@@ -125,6 +122,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    val engineHomePath: String
+        get() = engineManager.homeDir.absolutePath
 
     private fun isStandaloneActive(): Boolean = _uiState.value.activeProfile?.isStandalone == true
 
@@ -175,8 +175,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { state ->
                     state.copy(
                         preferences = prefs,
-                        workspaceCwd = if (state.workspaceCwd.isBlank() || state.workspaceCwd == "/data/data/com.termux/files/home" && profile.isStandalone) {
-                            profile.defaultCwd
+                        workspaceCwd = if (state.workspaceCwd.isBlank() || state.workspaceCwd.startsWith("/data/data/com.termux")) {
+                            profile.defaultCwd.ifBlank { engineManager.homeDir.absolutePath }
                         } else {
                             state.workspaceCwd
                         }
@@ -277,7 +277,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     ?: profile.defaultCwd.ifBlank { engineManager.homeDir.absolutePath }
                 val projExtras = activeProj?.extraDirs.orEmpty()
                 if (engineManager.isAgyInstalled()) {
-                    engineManager.migrateTermuxCredentialsIfNeeded()
                     val priv = engineManager.detectPrivilegeLevel()
                     val arch = engineManager.detectArch()
                     _uiState.update {
@@ -420,6 +419,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             refreshQuota()
+            refreshSessions()
         }
     }
 
@@ -682,16 +682,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendPrompt(overridePrompt: String? = null) {
+    fun addAttachments(items: List<PendingAttachmentUi>) {
+        if (items.isEmpty()) return
+        _uiState.update { state ->
+            state.copy(pendingAttachments = state.pendingAttachments + items)
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        _uiState.update { state ->
+            state.copy(pendingAttachments = state.pendingAttachments.filterNot { it.id == id })
+        }
+    }
+
+    fun sendPrompt(
+        overridePrompt: String? = null,
+        overrideAttachments: List<PendingAttachmentUi>? = null
+    ) {
         val raw = (overridePrompt ?: _uiState.value.composerText).trim()
-        if (raw.isEmpty()) return
+        val attachments = overrideAttachments ?: if (overridePrompt == null) {
+            _uiState.value.pendingAttachments
+        } else {
+            emptyList()
+        }
+        if (raw.isEmpty() && attachments.isEmpty()) return
 
         val isTurnActive = _uiState.value.isStreaming ||
             activePromptJob?.isActive == true ||
             _uiState.value.runningTasks.isNotEmpty()
 
         // Handle local slash commands typed manually and submitted
-        if (raw.startsWith("/") && !isTurnActive) {
+        if (raw.startsWith("/") && !isTurnActive && attachments.isEmpty()) {
             val head = raw.substringBefore(' ').lowercase()
             val matched = SlashCommandCatalog.builtIn.firstOrNull {
                 it.command == head || it.aliases.contains(head)
@@ -708,11 +729,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (isTurnActive && overridePrompt == null) {
-            if (raw.startsWith("/")) return
-            val queued = QueuedMessageUi(text = raw)
+            if (raw.startsWith("/") && attachments.isEmpty()) return
+            val queued = QueuedMessageUi(text = raw, attachments = attachments)
             _uiState.update { state ->
                 state.copy(
                     composerText = "",
+                    pendingAttachments = emptyList(),
                     queuedMessages = state.queuedMessages + queued
                 )
             }
@@ -725,7 +747,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val userMsg = ChatMessageUi(role = MessageRole.USER, text = raw)
+        val displayText = raw.ifBlank {
+            "Attached ${attachments.size} file${if (attachments.size == 1) "" else "s"}"
+        }
+        val userMsg = ChatMessageUi(
+            role = MessageRole.USER,
+            text = displayText,
+            attachmentLabels = attachments.map { it.displayName }
+        )
         val agentMsg = ChatMessageUi(role = MessageRole.AGENT, isStreaming = true)
         activeAgentMessageId = agentMsg.id
         val myGen = ++turnGeneration
@@ -733,6 +762,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { state ->
             state.copy(
                 composerText = if (overridePrompt == null) "" else state.composerText,
+                pendingAttachments = if (overridePrompt == null && overrideAttachments == null) {
+                    emptyList()
+                } else {
+                    state.pendingAttachments
+                },
                 messages = state.messages + userMsg + agentMsg,
                 isStreaming = true,
                 statusBanner = null
@@ -740,18 +774,50 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         AgentForegroundService.start(getApplication(), "Running task…")
 
+        val promptBlocks = buildJsonArray {
+            add(buildJsonObject {
+                put("type", "text")
+                put("text", raw.ifBlank { "Please inspect the attached file(s)." })
+            })
+            attachments.forEach { att ->
+                when {
+                    att.isImage && !att.base64Data.isNullOrBlank() -> {
+                        add(buildJsonObject {
+                            put("type", "image")
+                            put("data", att.base64Data)
+                            put("mimeType", att.mimeType)
+                        })
+                    }
+                    !att.textContent.isNullOrBlank() -> {
+                        add(buildJsonObject {
+                            put("type", "resource")
+                            put("resource", buildJsonObject {
+                                put("uri", "file://${att.localPath ?: att.displayName}")
+                                put("mimeType", att.mimeType)
+                                put("text", att.textContent)
+                            })
+                        })
+                    }
+                    !att.localPath.isNullOrBlank() -> {
+                        add(buildJsonObject {
+                            put("type", "text")
+                            put(
+                                "text",
+                                "[Attached file: ${att.displayName} (${att.mimeType}) staged at ${att.localPath}]"
+                            )
+                        })
+                    }
+                }
+            }
+        }
+
         activePromptJob = viewModelScope.launch {
             try {
                 acpRequest(
                     method = "session/prompt",
                     params = buildJsonObject {
                         put("sessionId", sessionId)
-                        put("prompt", buildJsonArray {
-                            add(buildJsonObject {
-                                put("type", "text")
-                                put("text", raw)
-                            })
-                        })
+                        put("prompt", promptBlocks)
                     },
                     timeoutMs = 300_000L
                 )
@@ -804,10 +870,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 withTimeoutOrNull(1_500L) {
                     previousJob?.join()
                 }
-                sendPrompt(overridePrompt = item.text)
+                sendPrompt(overridePrompt = item.text, overrideAttachments = item.attachments)
             }
         } else {
-            sendPrompt(overridePrompt = item.text)
+            sendPrompt(overridePrompt = item.text, overrideAttachments = item.attachments)
         }
     }
 
@@ -874,7 +940,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadSavedSession(sessionId: String) {
-        val cwd = _uiState.value.workspaceCwd
+        val cwd = _uiState.value.savedSessions
+            .firstOrNull { it.id == sessionId }
+            ?.cwd
+            ?.takeIf { it.isNotBlank() }
+            ?: _uiState.value.workspaceCwd
         turnGeneration++
         activePromptJob?.cancel()
         activePromptJob = null
@@ -1245,9 +1315,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val acpRes = runCatching {
                     acpRequest(
                         method = "session/list",
-                        params = buildJsonObject {
-                            put("cwd", _uiState.value.workspaceCwd)
-                        }
+                        params = buildJsonObject {}
                     )
                 }
                 if (acpRes.isSuccess) {
@@ -1656,199 +1724,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun copyAndOpenTermux(ctx: Application, command: String) {
-        val cm = ctx.getSystemService(ClipboardManager::class.java)
-        cm?.setPrimaryClip(ClipData.newPlainText("Agy Bridge Setup", command))
-        TermuxBridgeBootstrap.openTermuxApp(ctx)
-    }
-
-    fun refreshTermuxStatus() {
-        val ctx = getApplication<Application>()
-        _uiState.update {
-            it.copy(
-                termuxInstalled = TermuxBridgeBootstrap.isTermuxInstalled(ctx),
-                hasTermuxPermission = TermuxBridgeBootstrap.hasRunCommandPermission(ctx)
-            )
-        }
-    }
-
-    fun onTermuxPermissionResult(granted: Boolean) {
-        refreshTermuxStatus()
-        if (granted) {
-            autoSetupAndStartBridge(useRootSu = false)
-        } else {
-            _uiState.update {
-                it.copy(
-                    isBootstrapping = false,
-                    bootstrapStatus = "Termux permission denied. Grant it in App Settings or use Zero-Touch Root (su)."
-                )
-            }
-        }
-    }
-
-    fun autoSetupAndStartBridge(useRootSu: Boolean = false) {
-        if (_uiState.value.isBootstrapping) return
-        val ctx = getApplication<Application>()
-        refreshTermuxStatus()
-
-        if (!TermuxBridgeBootstrap.isTermuxInstalled(ctx)) {
-            _uiState.update {
-                it.copy(bootstrapStatus = "Termux (com.termux) is not installed on this device.")
-            }
-            return
-        }
-
-        val runCommandSupported = TermuxBridgeBootstrap.isRunCommandSupported(ctx)
-        if (!useRootSu && runCommandSupported && !TermuxBridgeBootstrap.hasRunCommandPermission(ctx)) {
-            _uiState.update {
-                it.copy(bootstrapStatus = "Requesting Termux RUN_COMMAND permission…")
-            }
-            onRequestTermuxPermission?.invoke()
-            return
-        }
-
-        viewModelScope.launch {
-            _uiState.update {
-                it.copy(
-                    isBootstrapping = true,
-                    bootstrapStatus = "Extracting bundled agy-bridge & generating pairing token…"
-                )
-            }
-
-            val prefs = _uiState.value.preferences
-            val baseLocal = prefs?.profiles?.firstOrNull { !it.isRemote && !it.isStandalone } ?: ConnectionProfile(
-                id = "local-termux",
-                name = "On-Device Termux",
-                host = "127.0.0.1",
-                port = 4789,
-                token = "",
-                useTls = false,
-                isRemote = false,
-                isStandalone = false
-            )
-            val ensuredToken = baseLocal.token.ifBlank { TermuxBridgeBootstrap.generateSecureToken() }
-            val updatedProfile = baseLocal.copy(token = ensuredToken)
-            settingsRepo.saveProfile(updatedProfile, setActive = true)
-
-            val stagedResult = runCatching {
-                TermuxBridgeBootstrap.extractBundledBridge(ctx, ensuredToken, updatedProfile.port)
-            }
-            val stagedBridge = stagedResult.getOrElse { err ->
-                _uiState.update {
-                    it.copy(
-                        isBootstrapping = false,
-                        bootstrapStatus = "Failed to unpack bridge assets: ${err.message}"
-                    )
-                }
-                return@launch
-            }
-
-            if (useRootSu) {
-                _uiState.update {
-                    it.copy(bootstrapStatus = "Bootstrapping Termux bridge via root (su -t 0)…")
-                }
-                val rootResult = TermuxBridgeBootstrap.launchViaRootSu(
-                    staged = stagedBridge,
-                    token = ensuredToken,
-                    port = updatedProfile.port
-                )
-                val rootMsg = rootResult.exceptionOrNull()?.message.orEmpty()
-                if (rootResult.isFailure) {
-                    if (rootMsg.contains("NEEDS_TERMUX_FIRST_INSTALL")) {
-                        val inlineCmd = TermuxBridgeBootstrap.buildSelfExtractingTermuxCommand(
-                            stagedBridge.files,
-                            ensuredToken,
-                            updatedProfile.port
-                        )
-                        copyAndOpenTermux(ctx, inlineCmd)
-                        _uiState.update {
-                            it.copy(
-                                bootstrapStatus = "Files staged! Termux needs 1-time nodejs-lts install — setup command copied to clipboard. Paste & press Enter in Termux; waiting for bridge…"
-                            )
-                        }
-                    } else {
-                        _uiState.update {
-                            it.copy(
-                                isBootstrapping = false,
-                                bootstrapStatus = "Root bootstrap failed: $rootMsg"
-                            )
-                        }
-                        return@launch
-                    }
-                }
-            } else if (!runCommandSupported) {
-                val inlineCmd = TermuxBridgeBootstrap.buildSelfExtractingTermuxCommand(
-                    stagedBridge.files,
-                    ensuredToken,
-                    updatedProfile.port
-                )
-                copyAndOpenTermux(ctx, inlineCmd)
-                _uiState.update {
-                    it.copy(
-                        bootstrapStatus = "Google Play Termux doesn't support RUN_COMMAND. Setup command copied to clipboard — paste & press Enter in Termux; waiting for bridge…"
-                    )
-                }
-            } else {
-                _uiState.update { it.copy(bootstrapStatus = "Sending setup command to Termux…") }
-                val launchResult = TermuxBridgeBootstrap.launchViaTermuxRunCommand(
-                    context = ctx,
-                    staged = stagedBridge,
-                    token = ensuredToken,
-                    port = updatedProfile.port,
-                    background = true
-                )
-                if (launchResult.isFailure) {
-                    val inlineCmd = TermuxBridgeBootstrap.buildSelfExtractingTermuxCommand(
-                        stagedBridge.files,
-                        ensuredToken,
-                        updatedProfile.port
-                    )
-                    copyAndOpenTermux(ctx, inlineCmd)
-                    _uiState.update {
-                        it.copy(
-                            bootstrapStatus = "Termux rejected background intent. Setup command copied to clipboard — paste & press Enter in Termux; waiting for bridge…"
-                        )
-                    }
-                }
-            }
-
-            _uiState.update { it.copy(bootstrapStatus = "Waiting for agy-bridge to respond on :${updatedProfile.port}…") }
-            var healthy = false
-            repeat(40) {
-                delay(1500)
-                val check = bridgeApi.getHealth(updatedProfile)
-                if (check.isSuccess) {
-                    val health = check.getOrNull()
-                    healthy = true
-                    _uiState.update {
-                        it.copy(
-                            isBootstrapping = false,
-                            health = health,
-                            statusBanner = null,
-                            bootstrapStatus = if (health?.agyVersion != null) {
-                                "Bridge online! agy=${health.agyVersion}, privilege=${health.privilegeLevel}"
-                            } else {
-                                "Bridge online! Install `agy` in Termux or tap Login / Terminal to sign in."
-                            }
-                        )
-                    }
-                    lastConnectedProfileKey = "${updatedProfile.id}:${updatedProfile.host}:${updatedProfile.port}:${updatedProfile.token}:${updatedProfile.useTls}"
-                    acpClient.connect(updatedProfile)
-                    return@launch
-                }
-            }
-
-            if (!healthy) {
-                _uiState.update {
-                    it.copy(
-                        isBootstrapping = false,
-                        bootstrapStatus = "Timed out waiting for bridge. On unrooted phones, ensure `allow-external-apps=true` is set in Termux (first install of nodejs-lts can also take ~30s)."
-                    )
-                }
-            }
-        }
-    }
-
     private fun handleSessionUpdate(event: AcpSessionEvent) {
         when (event) {
             is AcpSessionEvent.UserMessageChunk -> {
@@ -2068,7 +1943,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         refreshDiff()
         refreshQuota()
         if (nextQueued != null) {
-            sendPrompt(overridePrompt = nextQueued.text)
+            sendPrompt(overridePrompt = nextQueued.text, overrideAttachments = nextQueued.attachments)
         } else {
             AgentForegroundService.stop(getApplication())
         }
