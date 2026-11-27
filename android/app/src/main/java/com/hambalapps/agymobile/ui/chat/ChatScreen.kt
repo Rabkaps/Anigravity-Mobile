@@ -71,6 +71,7 @@ import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AssistChip
@@ -347,6 +348,7 @@ fun ChatScreen(
                             onTextChange = viewModel::updateComposerText,
                             onSend = { viewModel.sendPrompt() },
                             onStop = viewModel::cancelTurn,
+                            onSendQueuedMessageNow = viewModel::sendQueuedMessageNow,
                             onRemoveQueuedMessage = viewModel::removeQueuedMessage,
                             onSlashTap = { viewModel.updateComposerText("/") },
                             onVoiceTap = onRequestVoice,
@@ -1185,6 +1187,7 @@ internal fun FloatingComposerSection(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onSendQueuedMessageNow: (String) -> Unit = {},
     onRemoveQueuedMessage: (String) -> Unit = {},
     onSlashTap: () -> Unit,
     onVoiceTap: () -> Unit,
@@ -1215,7 +1218,8 @@ internal fun FloatingComposerSection(
         ) {
             RunningTasksPill(
                 runningTools = state.runningTasks,
-                runningSubagents = activeSubagents
+                runningSubagents = activeSubagents,
+                onStop = onStop
             )
         }
 
@@ -1226,6 +1230,7 @@ internal fun FloatingComposerSection(
         ) {
             QueuedMessagesStrip(
                 queuedMessages = state.queuedMessages,
+                onSendNow = onSendQueuedMessageNow,
                 onRemove = onRemoveQueuedMessage
             )
         }
@@ -1356,7 +1361,7 @@ internal fun FloatingComposerSection(
                     )
                 }
 
-                if (state.isStreaming && state.composerText.isNotBlank()) {
+                if ((state.isStreaming || hasRunningTasks) && state.composerText.isNotBlank()) {
                     FilledTonalIconButton(
                         onClick = onSend,
                         modifier = Modifier.size(48.dp)
@@ -1369,7 +1374,7 @@ internal fun FloatingComposerSection(
                 }
 
                 MorphingActionButton(
-                    isStreaming = state.isStreaming,
+                    isStreaming = state.isStreaming || hasRunningTasks,
                     enabled = state.composerText.isNotBlank(),
                     onSend = onSend,
                     onStop = onStop
@@ -1382,7 +1387,8 @@ internal fun FloatingComposerSection(
 @Composable
 private fun RunningTasksPill(
     runningTools: List<ToolCallUi>,
-    runningSubagents: List<com.hambalapps.agymobile.data.acp.AcpSubagentInfo>
+    runningSubagents: List<com.hambalapps.agymobile.data.acp.AcpSubagentInfo>,
+    onStop: () -> Unit = {}
 ) {
     var expanded by remember { mutableStateOf(false) }
     val totalCount = runningTools.size + runningSubagents.size
@@ -1421,6 +1427,17 @@ private fun RunningTasksPill(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                IconButton(
+                    onClick = onStop,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Stop,
+                        contentDescription = "Stop running tasks",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
                 Icon(
                     imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                     contentDescription = if (expanded) "Collapse tasks" else "Expand tasks",
@@ -1461,6 +1478,7 @@ private fun RunningTasksPill(
 @Composable
 private fun QueuedMessagesStrip(
     queuedMessages: List<QueuedMessageUi>,
+    onSendNow: (String) -> Unit = {},
     onRemove: (String) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1502,6 +1520,17 @@ private fun QueuedMessagesStrip(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
+                    IconButton(
+                        onClick = { onSendNow(item.id) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.Send,
+                            contentDescription = "Send queued message now",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     IconButton(
                         onClick = { onRemove(item.id) },
                         modifier = Modifier.size(32.dp)

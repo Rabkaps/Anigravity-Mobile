@@ -29,6 +29,8 @@ import com.hambalapps.agymobile.data.local.LocalProject
 import com.hambalapps.agymobile.data.local.SettingsRepository
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,6 +38,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -77,6 +80,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastConnectedProfileKey: String? = null
     private var activeAgentMessageId: String? = null
     private var activeUserMessageId: String? = null
+    private var activePromptJob: Job? = null
+    private var turnGeneration: Long = 0L
+
+    private val terminalTaskStatuses = setOf("completed", "failed", "error", "cancelled", "done")
 
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
         if (grantResult == PackageManager.PERMISSION_GRANTED) {
@@ -679,8 +686,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val raw = (overridePrompt ?: _uiState.value.composerText).trim()
         if (raw.isEmpty()) return
 
+        val isTurnActive = _uiState.value.isStreaming ||
+            activePromptJob?.isActive == true ||
+            _uiState.value.runningTasks.isNotEmpty()
+
         // Handle local slash commands typed manually and submitted
-        if (raw.startsWith("/") && !_uiState.value.isStreaming) {
+        if (raw.startsWith("/") && !isTurnActive) {
             val head = raw.substringBefore(' ').lowercase()
             val matched = SlashCommandCatalog.builtIn.firstOrNull {
                 it.command == head || it.aliases.contains(head)
@@ -696,12 +707,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        if (_uiState.value.isStreaming) {
+        if (isTurnActive && overridePrompt == null) {
             if (raw.startsWith("/")) return
             val queued = QueuedMessageUi(text = raw)
             _uiState.update { state ->
                 state.copy(
-                    composerText = if (overridePrompt == null) "" else state.composerText,
+                    composerText = "",
                     queuedMessages = state.queuedMessages + queued
                 )
             }
@@ -717,6 +728,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val userMsg = ChatMessageUi(role = MessageRole.USER, text = raw)
         val agentMsg = ChatMessageUi(role = MessageRole.AGENT, isStreaming = true)
         activeAgentMessageId = agentMsg.id
+        val myGen = ++turnGeneration
 
         _uiState.update { state ->
             state.copy(
@@ -728,8 +740,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         AgentForegroundService.start(getApplication(), "Running task…")
 
-        viewModelScope.launch {
-            runCatching {
+        activePromptJob = viewModelScope.launch {
+            try {
                 acpRequest(
                     method = "session/prompt",
                     params = buildJsonObject {
@@ -743,21 +755,60 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     },
                     timeoutMs = 300_000L
                 )
-            }.onSuccess {
-                finalizeAgentTurn()
-            }.onFailure { err ->
-                appendAgentError(err.message ?: "Prompt failed")
+                if (myGen == turnGeneration) {
+                    finalizeAgentTurn()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                if (myGen == turnGeneration) {
+                    appendAgentError(err.message ?: "Prompt failed")
+                }
             }
         }
     }
 
     fun cancelTurn() {
-        val sessionId = _uiState.value.sessionId ?: return
-        acpNotify(
-            method = "session/cancel",
-            params = buildJsonObject { put("sessionId", sessionId) }
-        )
-        finalizeAgentTurn()
+        cancelActiveTurnInternal()
+    }
+
+    private fun cancelActiveTurnInternal() {
+        val sessionId = _uiState.value.sessionId
+        if (sessionId != null) {
+            acpNotify(
+                method = "session/cancel",
+                params = buildJsonObject { put("sessionId", sessionId) }
+            )
+        }
+        turnGeneration++
+        settleTurnState(finalTaskStatus = "cancelled")
+        AgentForegroundService.stop(getApplication())
+    }
+
+    fun sendQueuedMessageNow(id: String) {
+        val item = _uiState.value.queuedMessages.firstOrNull { it.id == id } ?: return
+        _uiState.update { state ->
+            state.copy(queuedMessages = state.queuedMessages.filterNot { it.id == id })
+        }
+
+        val wasActive = _uiState.value.isStreaming ||
+            activePromptJob?.isActive == true ||
+            _uiState.value.runningTasks.isNotEmpty() ||
+            _uiState.value.activeSubagents.any { it.status.lowercase() !in terminalTaskStatuses }
+
+        if (wasActive) {
+            val previousJob = activePromptJob
+            cancelActiveTurnInternal()
+            viewModelScope.launch {
+                // Wait briefly for `agy acp` to unwind the cancelled `session/prompt` before starting the next turn.
+                withTimeoutOrNull(1_500L) {
+                    previousJob?.join()
+                }
+                sendPrompt(overridePrompt = item.text)
+            }
+        } else {
+            sendPrompt(overridePrompt = item.text)
+        }
     }
 
     fun respondPermission(request: AcpPermissionRequest, optionId: String?) {
@@ -774,6 +825,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startFreshChat() {
+        turnGeneration++
+        activePromptJob?.cancel()
+        activePromptJob = null
         AgentForegroundService.stop(getApplication())
         activeAgentMessageId = null
         activeUserMessageId = null
@@ -821,6 +875,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadSavedSession(sessionId: String) {
         val cwd = _uiState.value.workspaceCwd
+        turnGeneration++
+        activePromptJob?.cancel()
+        activePromptJob = null
         activeAgentMessageId = null
         activeUserMessageId = null
         _uiState.update {
@@ -1957,19 +2014,57 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun finalizeAgentTurn() {
+    private fun settleTurnState(
+        finalTaskStatus: String,
+        popNextQueued: Boolean = false,
+        errorText: String? = null
+    ) {
         val targetId = activeAgentMessageId
         activeAgentMessageId = null
-        val nextQueued = _uiState.value.queuedMessages.firstOrNull()
         _uiState.update { state ->
             state.copy(
                 isStreaming = false,
-                queuedMessages = if (nextQueued != null) state.queuedMessages.drop(1) else state.queuedMessages,
+                queuedMessages = if (popNextQueued && state.queuedMessages.isNotEmpty()) {
+                    state.queuedMessages.drop(1)
+                } else {
+                    state.queuedMessages
+                },
+                activeSubagents = state.activeSubagents.map { agent ->
+                    if (agent.status.lowercase() !in terminalTaskStatuses) {
+                        agent.copy(status = finalTaskStatus)
+                    } else {
+                        agent
+                    }
+                },
                 messages = state.messages.map { msg ->
-                    if (msg.id == targetId) msg.copy(isStreaming = false) else msg
+                    val settledTools = msg.toolCalls.map { tool ->
+                        if (tool.status.lowercase() !in terminalTaskStatuses) {
+                            tool.copy(status = finalTaskStatus)
+                        } else {
+                            tool
+                        }
+                    }
+                    when {
+                        msg.id == targetId && errorText != null -> msg.copy(
+                            text = (msg.text + "\n\n**Error:** $errorText").trim(),
+                            isStreaming = false,
+                            toolCalls = settledTools
+                        )
+                        msg.id == targetId || msg.isStreaming || settledTools != msg.toolCalls -> msg.copy(
+                            isStreaming = false,
+                            toolCalls = settledTools
+                        )
+                        else -> msg
+                    }
                 }
             )
         }
+    }
+
+    private fun finalizeAgentTurn() {
+        activePromptJob = null
+        val nextQueued = _uiState.value.queuedMessages.firstOrNull()
+        settleTurnState(finalTaskStatus = "completed", popNextQueued = nextQueued != null)
         refreshDiff()
         refreshQuota()
         if (nextQueued != null) {
@@ -1980,22 +2075,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendAgentError(errorText: String) {
+        activePromptJob = null
         AgentForegroundService.stop(getApplication())
-        val targetId = activeAgentMessageId
-        activeAgentMessageId = null
-        _uiState.update { state ->
-            state.copy(
-                isStreaming = false,
-                messages = state.messages.map { msg ->
-                    if (msg.id == targetId) {
-                        msg.copy(
-                            text = (msg.text + "\n\n**Error:** $errorText").trim(),
-                            isStreaming = false
-                        )
-                    } else msg
-                }
-            )
-        }
+        settleTurnState(finalTaskStatus = "failed", errorText = errorText)
     }
 
     override fun onCleared() {
