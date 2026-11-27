@@ -1,5 +1,7 @@
 package com.hambalapps.agymobile.data.engine
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -26,6 +28,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -280,6 +283,8 @@ class StandaloneEngineManager(
             env["no_proxy"] = "127.0.0.1,localhost,::1"
         }
         ensureBrowserShims()
+        ensureClipboardShims()
+        ensureMobileEnvRules()
         ensureAgyWrapper()
         val xdgOpenPath = File(usrDir, "bin/xdg-open").absolutePath
         env["BROWSER"] = xdgOpenPath
@@ -472,10 +477,8 @@ class StandaloneEngineManager(
 
             if (method == "CONNECT") {
                 val (host, port) = parseHostPort(target, 443) ?: return
-                val upstream = Socket()
-                runCatching {
-                    upstream.connect(InetSocketAddress(InetAddress.getByName(host), port), 15_000)
-                }.onFailure {
+                val upstream = connectWithRetry(host, port)
+                if (upstream == null) {
                     out.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
                     out.flush()
                     return
@@ -492,10 +495,8 @@ class StandaloneEngineManager(
                 val host = uri.host ?: return
                 val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("https", true)) 443 else 80
                 val path = (uri.rawPath?.ifEmpty { "/" } ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
-                val upstream = Socket()
-                runCatching {
-                    upstream.connect(InetSocketAddress(InetAddress.getByName(host), port), 15_000)
-                }.onFailure {
+                val upstream = connectWithRetry(host, port)
+                if (upstream == null) {
                     out.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
                     out.flush()
                     return
@@ -519,6 +520,28 @@ class StandaloneEngineManager(
                 }
             }
         }
+    }
+
+    private fun connectWithRetry(host: String, port: Int): Socket? {
+        val backoffsMs = longArrayOf(0L, 400L, 1000L)
+        for (attempt in backoffsMs.indices) {
+            if (backoffsMs[attempt] > 0L) {
+                runCatching { Thread.sleep(backoffsMs[attempt]) }
+            }
+            val addrs = runCatching {
+                InetAddress.getAllByName(host).sortedBy { if (it is Inet4Address) 0 else 1 }
+            }.getOrNull().orEmpty()
+            for (addr in addrs) {
+                val sock = Socket()
+                val ok = runCatching {
+                    sock.connect(InetSocketAddress(addr, port), 10_000)
+                    true
+                }.getOrDefault(false)
+                if (ok) return sock
+                runCatching { sock.close() }
+            }
+        }
+        return null
     }
 
     private fun parseHostPort(hostPort: String, defaultPort: Int): Pair<String, Int>? {
@@ -592,22 +615,53 @@ class StandaloneEngineManager(
                 read += n
             }
             val body = String(bodyChars, 0, read).trim()
-            val url = if (requestLine.startsWith("POST ")) {
-                body
+            val reqParts = requestLine.split(" ")
+            val method = reqParts.getOrNull(0)?.uppercase() ?: "GET"
+            val reqPath = reqParts.getOrNull(1) ?: "/"
+
+            val (status, msg) = if (reqPath.startsWith("/clipboard")) {
+                if (method == "POST") {
+                    setAndroidClipboard(body)
+                    "HTTP/1.1 200 OK" to "ok\n"
+                } else {
+                    "HTTP/1.1 200 OK" to getAndroidClipboard()
+                }
             } else {
-                val query = requestLine.substringAfter(" ", "").substringBefore(" ").substringAfter("url=", "")
-                URLDecoder.decode(query, "UTF-8")
+                val url = if (method == "POST") {
+                    body
+                } else {
+                    val query = reqPath.substringAfter("url=", "")
+                    URLDecoder.decode(query, "UTF-8")
+                }
+                val ok = openUrlInBrowser(url)
+                if (ok) "HTTP/1.1 200 OK" to "ok\n" else "HTTP/1.1 400 Bad Request" to "invalid url\n"
             }
 
-            val ok = openUrlInBrowser(url)
-            val msg = if (ok) "ok\n" else "invalid url\n"
             val bytes = msg.toByteArray(Charsets.UTF_8)
-            val status = if (ok) "HTTP/1.1 200 OK" else "HTTP/1.1 400 Bad Request"
             val header = "$status\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
             sock.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
             sock.getOutputStream().write(bytes)
             sock.getOutputStream().flush()
         }
+    }
+
+    private fun setAndroidClipboard(text: String) {
+        if (text.isEmpty()) return
+        val applyClip = {
+            runCatching {
+                val cm = context.getSystemService(ClipboardManager::class.java)
+                cm?.setPrimaryClip(ClipData.newPlainText("CLI output", text))
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) applyClip()
+        else Handler(Looper.getMainLooper()).post { applyClip() }
+    }
+
+    private fun getAndroidClipboard(): String {
+        val cm = context.getSystemService(ClipboardManager::class.java) ?: return ""
+        return runCatching {
+            cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+        }.getOrDefault("")
     }
 
     private fun ensureBrowserShims() {
@@ -668,6 +722,77 @@ exit 1
                     shimFile.writeText(script)
                 }
                 chmod755(shimFile)
+            }
+        }
+    }
+
+    private fun ensureClipboardShims() {
+        val setScript = """#!/system/bin/sh
+if [ -z "${'$'}AGY_BROWSER_PORT" ]; then
+  exit 1
+fi
+DATA=""
+if [ ! -t 0 ]; then
+  DATA="${'$'}(cat)"
+elif [ "${'$'}#" -gt 0 ]; then
+  DATA="${'$'}*"
+fi
+CURL_BIN="${'$'}{PREFIX}/bin/curl"
+if [ -x "${'$'}CURL_BIN" ]; then
+  printf '%s' "${'$'}DATA" | "${'$'}CURL_BIN" --noproxy '*' -sS -f -X POST --data-binary @- "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/clipboard" >/dev/null
+  exit ${'$'}?
+fi
+NODE_BIN="${'$'}{PREFIX}/bin/node"
+if [ -x "${'$'}NODE_BIN" ]; then
+  printf '%s' "${'$'}DATA" | exec "${'$'}NODE_BIN" -e 'const fs=require("fs"),http=require("http");const d=fs.readFileSync(0,"utf8");const r=http.request("http://127.0.0.1:"+process.env.AGY_BROWSER_PORT+"/clipboard",{method:"POST"},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1));});r.on("error",()=>process.exit(1));r.end(d);'
+fi
+exit 1
+"""
+        val getScript = """#!/system/bin/sh
+if [ -z "${'$'}AGY_BROWSER_PORT" ]; then
+  exit 1
+fi
+CURL_BIN="${'$'}{PREFIX}/bin/curl"
+if [ -x "${'$'}CURL_BIN" ]; then
+  exec "${'$'}CURL_BIN" --noproxy '*' -sS -f "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/clipboard"
+fi
+NODE_BIN="${'$'}{PREFIX}/bin/node"
+if [ -x "${'$'}NODE_BIN" ]; then
+  exec "${'$'}NODE_BIN" -e 'require("http").get("http://127.0.0.1:"+process.env.AGY_BROWSER_PORT+"/clipboard",res=>{res.pipe(process.stdout);}).on("error",()=>process.exit(1));'
+fi
+exit 1
+"""
+        listOf("termux-clipboard-set", "xclip", "xsel", "wl-copy").forEach { name ->
+            val f = File(usrDir, "bin/$name")
+            runCatching {
+                f.parentFile?.mkdirs()
+                if (!f.exists() || f.readText() != setScript) f.writeText(setScript)
+                chmod755(f)
+            }
+        }
+        val getFile = File(usrDir, "bin/termux-clipboard-get")
+        runCatching {
+            getFile.parentFile?.mkdirs()
+            if (!getFile.exists() || getFile.readText() != getScript) getFile.writeText(getScript)
+            chmod755(getFile)
+        }
+    }
+
+    private fun ensureMobileEnvRules() {
+        val geminiFile = File(homeDir, ".gemini/GEMINI.md")
+        val marker = "<!-- antigravity-mobile-env -->"
+        val block = """$marker
+## Android Mobile Runtime Bridge
+- `BROWSER`, `GH_BROWSER`, `xdg-open`, and `termux-open-url` are natively bridged to open URLs in the user's Android browser. **Never** override `BROWSER=true` when running interactive CLI auth flows (such as `gh auth login --web`).
+- `termux-clipboard-set`, `termux-clipboard-get`, `xclip`, `xsel`, and `wl-copy` are natively bridged to the Android clipboard.
+$marker
+"""
+        runCatching {
+            geminiFile.parentFile?.mkdirs()
+            val existing = if (geminiFile.exists()) geminiFile.readText(Charsets.UTF_8) else ""
+            if (!existing.contains(marker)) {
+                val updated = if (existing.isBlank()) block else "$existing\n\n$block"
+                geminiFile.writeText(updated, Charsets.UTF_8)
             }
         }
     }

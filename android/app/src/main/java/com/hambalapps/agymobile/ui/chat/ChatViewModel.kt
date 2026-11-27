@@ -17,6 +17,7 @@ import com.hambalapps.agymobile.data.acp.AcpWebSocketClient
 import com.hambalapps.agymobile.data.acp.BridgeApiClient
 import com.hambalapps.agymobile.data.acp.HealthResponse
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
+import com.hambalapps.agymobile.data.engine.AgentForegroundService
 import com.hambalapps.agymobile.data.engine.LocalAcpClient
 import com.hambalapps.agymobile.data.engine.PluginMarketplaceManager
 import com.hambalapps.agymobile.data.engine.QuotaClient
@@ -725,6 +726,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 statusBanner = null
             )
         }
+        AgentForegroundService.start(getApplication(), "Running task…")
 
         viewModelScope.launch {
             runCatching {
@@ -772,6 +774,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startFreshChat() {
+        AgentForegroundService.stop(getApplication())
         activeAgentMessageId = null
         activeUserMessageId = null
         _uiState.update {
@@ -1971,10 +1974,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         refreshQuota()
         if (nextQueued != null) {
             sendPrompt(overridePrompt = nextQueued.text)
+        } else {
+            AgentForegroundService.stop(getApplication())
         }
     }
 
     private fun appendAgentError(errorText: String) {
+        AgentForegroundService.stop(getApplication())
         val targetId = activeAgentMessageId
         activeAgentMessageId = null
         _uiState.update { state ->
@@ -1994,6 +2000,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        AgentForegroundService.stop(getApplication())
         runCatching {
             Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
             Shizuku.removeBinderReceivedListener(shizukuBinderListener)
