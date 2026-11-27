@@ -17,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -24,18 +25,42 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextDirection
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 import com.hambalapps.agymobile.ui.theme.MonoCodeStyle
 import kotlinx.coroutines.delay
+
+private const val LRI = "\u2066"
+private const val PDI = "\u2069"
+
+internal fun detectTextDirection(text: String): TextDirection {
+    for (ch in text) {
+        if (ch.isWhitespace() || ch in "#*-`[]>._~|/\\:()[]{}\"'0123456789") continue
+        when (Character.getDirectionality(ch)) {
+            Character.DIRECTIONALITY_RIGHT_TO_LEFT,
+            Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC -> return TextDirection.Rtl
+            Character.DIRECTIONALITY_LEFT_TO_RIGHT -> return TextDirection.Ltr
+        }
+    }
+    return TextDirection.Content
+}
 
 private sealed interface MarkdownBlock {
     data class Paragraph(val text: String) : MarkdownBlock
@@ -107,6 +132,7 @@ fun MarkdownText(
     val blocks = remember(markdown) { parseMarkdownBlocks(markdown) }
     val codeBg = MaterialTheme.colorScheme.surfaceContainerHighest
     val codeFg = MaterialTheme.colorScheme.primary
+    val linkColor = MaterialTheme.colorScheme.primary
 
     Column(
         modifier = modifier,
@@ -120,21 +146,29 @@ fun MarkdownText(
                         2 -> MaterialTheme.typography.titleMedium
                         else -> MaterialTheme.typography.labelLarge
                     }
+                    val dir = detectTextDirection(block.text)
                     Text(
-                        text = buildInlineStyled(block.text, codeBg, codeFg),
-                        style = style,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = buildInlineStyled(block.text, codeBg, codeFg, linkColor),
+                        style = style.copy(textDirection = dir),
+                        textAlign = TextAlign.Start,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
                 is MarkdownBlock.Paragraph -> {
+                    val dir = detectTextDirection(block.text)
                     Text(
-                        text = buildInlineStyled(block.text, codeBg, codeFg),
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = buildInlineStyled(block.text, codeBg, codeFg, linkColor),
+                        style = MaterialTheme.typography.bodyLarge.copy(textDirection = dir),
+                        textAlign = TextAlign.Start,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
                 is MarkdownBlock.CodeFence -> {
-                    CodeFenceCard(language = block.language, code = block.code)
+                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                        CodeFenceCard(language = block.language, code = block.code)
+                    }
                 }
             }
         }
@@ -188,7 +222,7 @@ private fun CodeFenceCard(language: String, code: String) {
             }
             Text(
                 text = code,
-                style = MonoCodeStyle,
+                style = MonoCodeStyle.copy(textDirection = TextDirection.Ltr),
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -199,14 +233,98 @@ private fun CodeFenceCard(language: String, code: String) {
     }
 }
 
+private fun AnnotatedString.Builder.appendLink(
+    label: String,
+    url: String,
+    linkColor: Color
+) {
+    val isBareUrl = label == url || label.startsWith("http://") || label.startsWith("https://")
+    if (isBareUrl) append(LRI)
+    withLink(
+        LinkAnnotation.Url(
+            url = url,
+            styles = TextLinkStyles(
+                style = SpanStyle(
+                    color = linkColor,
+                    textDecoration = TextDecoration.Underline
+                )
+            )
+        )
+    ) {
+        append(label)
+    }
+    if (isBareUrl) append(PDI)
+}
+
+private fun consumeBareUrl(input: String, start: Int): String? {
+    if (!input.startsWith("https://", start) && !input.startsWith("http://", start)) return null
+    var end = start
+    while (end < input.length) {
+        val ch = input[end]
+        if (ch.isWhitespace() || ch == '<' || ch == '>' || ch == '"' || ch == '\'') break
+        end++
+    }
+    var raw = input.substring(start, end)
+    while (raw.isNotEmpty()) {
+        val last = raw.last()
+        val isTrailingPunct = last in ".,;:!?" ||
+            (last == ')' && raw.count { it == '(' } < raw.count { it == ')' })
+        if (!isTrailingPunct) break
+        raw = raw.dropLast(1)
+    }
+    return raw.takeIf { it.length > 8 }
+}
+
+internal fun linkifyPlainText(input: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
+    var i = 0
+    while (i < input.length) {
+        val bareUrl = consumeBareUrl(input, i)
+        if (bareUrl != null) {
+            appendLink(bareUrl, bareUrl, linkColor)
+            i += bareUrl.length
+        } else {
+            append(input[i++])
+        }
+    }
+}
+
 private fun buildInlineStyled(
     input: String,
-    inlineCodeBg: androidx.compose.ui.graphics.Color,
-    inlineCodeFg: androidx.compose.ui.graphics.Color
+    inlineCodeBg: Color,
+    inlineCodeFg: Color,
+    linkColor: Color
 ): AnnotatedString = buildAnnotatedString {
     var i = 0
     while (i < input.length) {
         when {
+            input[i] == '[' -> {
+                val closeBracket = input.indexOf(']', i + 1)
+                if (closeBracket > i + 1 &&
+                    closeBracket + 1 < input.length &&
+                    input[closeBracket + 1] == '('
+                ) {
+                    val closeParen = input.indexOf(')', closeBracket + 2)
+                    if (closeParen > closeBracket + 2) {
+                        val label = input.substring(i + 1, closeBracket)
+                        val url = input.substring(closeBracket + 2, closeParen).trim()
+                        if (url.startsWith("https://") || url.startsWith("http://")) {
+                            appendLink(label, url, linkColor)
+                            i = closeParen + 1
+                            continue
+                        }
+                    }
+                }
+                append(input[i++])
+            }
+            input.startsWith("https://", i) || input.startsWith("http://", i) -> {
+                val url = consumeBareUrl(input, i)
+                if (url != null) {
+                    appendLink(url, url, linkColor)
+                    i += url.length
+                } else {
+                    append(input[i++])
+                }
+            }
             input.startsWith("**", i) -> {
                 val end = input.indexOf("**", i + 2)
                 if (end > i + 2) {
@@ -221,6 +339,7 @@ private fun buildInlineStyled(
             input.startsWith("`", i) -> {
                 val end = input.indexOf('`', i + 1)
                 if (end > i + 1) {
+                    append(LRI)
                     withStyle(
                         SpanStyle(
                             fontFamily = FontFamily.Monospace,
@@ -230,6 +349,7 @@ private fun buildInlineStyled(
                     ) {
                         append(" ${input.substring(i + 1, end)} ")
                     }
+                    append(PDI)
                     i = end + 1
                 } else {
                     append(input[i++])

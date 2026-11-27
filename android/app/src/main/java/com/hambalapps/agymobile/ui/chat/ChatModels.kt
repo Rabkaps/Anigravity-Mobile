@@ -75,6 +75,7 @@ data class ChatUiState(
     val authInProgress: Boolean = false,
     val authError: String? = null,
     val statusBanner: String? = null,
+    val pendingBrowserUrl: String? = null,
     val sessionId: String? = null,
     val workspaceCwd: String = "/data/data/com.termux/files/home",
     val extraDirs: List<String> = emptyList(),

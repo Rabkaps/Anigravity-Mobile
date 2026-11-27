@@ -65,6 +65,7 @@ import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
@@ -262,6 +263,24 @@ fun ChatScreen(
                                 onReconnect = viewModel::reconnect,
                                 onOpenTerminal = viewModel::openTerminalSheet,
                                 onOpenSettings = { viewModel.openSheet(ActiveSheet.SETTINGS) }
+                            )
+                        }
+
+                        AnimatedVisibility(
+                            visible = state.pendingBrowserUrl != null,
+                            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+                            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+                        ) {
+                            BrowserUrlBanner(
+                                url = state.pendingBrowserUrl.orEmpty(),
+                                onOpen = {
+                                    val url = state.pendingBrowserUrl
+                                    if (!url.isNullOrBlank()) {
+                                        viewModel.openUrlInBrowser(url, force = true)
+                                    }
+                                    viewModel.dismissPendingBrowserUrl()
+                                },
+                                onDismiss = viewModel::dismissPendingBrowserUrl
                             )
                         }
 
@@ -613,6 +632,57 @@ private fun StatusNoticeBanner(
 }
 
 @Composable
+private fun BrowserUrlBanner(
+    url: String,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        shape = M3ExpressiveShape.Large,
+        color = MaterialTheme.colorScheme.secondaryContainer
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.OpenInBrowser,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(20.dp)
+            )
+            Text(
+                text = url,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            FilledTonalButton(
+                onClick = onOpen,
+                shape = M3ExpressiveShape.Full,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                Text("Open")
+            }
+            IconButton(onClick = onDismiss, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    imageVector = Icons.Rounded.Close,
+                    contentDescription = "Dismiss",
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 internal fun EmptyChatHero(
     state: ChatUiState,
     onQuickPrompt: (String) -> Unit,
@@ -829,7 +899,9 @@ internal fun MessageBubbleItem(
                 ) {
                     Text(
                         text = message.text,
-                        style = MaterialTheme.typography.bodyLarge,
+                        style = MaterialTheme.typography.bodyLarge.copy(
+                            textDirection = detectTextDirection(message.text)
+                        ),
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
                     )
                 }
@@ -875,8 +947,11 @@ internal fun MessageBubbleItem(
                             message.planSteps.forEach { step ->
                                 Text(
                                     text = "• $step",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        textDirection = detectTextDirection(step)
+                                    ),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                             }
                         }
@@ -953,9 +1028,13 @@ private fun ThinkingPill(thinkingText: String) {
             ) {
                 Text(
                     text = thinkingText,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        textDirection = detectTextDirection(thinkingText)
+                    ),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 6.dp)
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
                 )
             }
         }
@@ -1068,8 +1147,12 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
                     shape = M3ExpressiveShape.Medium,
                     color = MaterialTheme.colorScheme.surfaceContainerLowest
                 ) {
+                    val linkColor = MaterialTheme.colorScheme.primary
+                    val linkedOutput = remember(tool.textOutput, linkColor) {
+                        linkifyPlainText(tool.textOutput.take(2000), linkColor)
+                    }
                     Text(
-                        text = tool.textOutput.take(2000),
+                        text = linkedOutput,
                         style = MonoCodeStyle,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1204,7 +1287,8 @@ internal fun FloatingComposerSection(
                         value = state.composerText,
                         onValueChange = onTextChange,
                         textStyle = MaterialTheme.typography.bodyLarge.copy(
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = MaterialTheme.colorScheme.onSurface,
+                            textDirection = detectTextDirection(state.composerText)
                         ),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                         modifier = Modifier.fillMaxWidth()

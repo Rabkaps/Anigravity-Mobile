@@ -61,6 +61,7 @@ import com.hambalapps.agymobile.data.acp.SessionSummary
 import com.hambalapps.agymobile.data.local.ConnectionProfile
 import com.hambalapps.agymobile.data.local.LocalProject
 import com.hambalapps.agymobile.ui.chat.ActiveSheet
+import com.hambalapps.agymobile.ui.chat.detectTextDirection
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 
@@ -426,7 +427,9 @@ fun SessionsDrawerContent(
                             ) {
                                 Text(
                                     text = session.title,
-                                    style = MaterialTheme.typography.bodyMedium,
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        textDirection = detectTextDirection(session.title)
+                                    ),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier

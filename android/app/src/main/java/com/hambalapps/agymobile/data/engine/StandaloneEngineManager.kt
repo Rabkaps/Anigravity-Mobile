@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.system.Os
 import com.hambalapps.agymobile.BuildConfig
@@ -279,7 +281,9 @@ class StandaloneEngineManager(
         }
         ensureBrowserShims()
         ensureAgyWrapper()
-        env["BROWSER"] = File(usrDir, "bin/xdg-open").absolutePath
+        val xdgOpenPath = File(usrDir, "bin/xdg-open").absolutePath
+        env["BROWSER"] = xdgOpenPath
+        env["GH_BROWSER"] = xdgOpenPath
         return env
     }
 
@@ -338,13 +342,22 @@ class StandaloneEngineManager(
         }
         lastOpenedBrowserUrl = trimmed
         lastOpenedBrowserAtMs = now
-        return runCatching {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(trimmed)).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(intent)
+        val launchIntent = {
+            runCatching {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(trimmed)).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                true
+            }.getOrDefault(false)
+        }
+        return if (Looper.myLooper() == Looper.getMainLooper()) {
+            launchIntent()
+        } else {
+            Handler(Looper.getMainLooper()).post { launchIntent() }
             true
-        }.getOrDefault(false)
+        }
     }
 
     @Synchronized
@@ -355,7 +368,7 @@ class StandaloneEngineManager(
         Thread({
             while (true) {
                 runCatching {
-                    val files = browserSpoolDir.listFiles()
+                    val files = browserSpoolDir.listFiles { f -> f.isFile && f.name.endsWith(".url") }
                     files?.sortedBy { it.lastModified() }?.forEach { file ->
                         val url = runCatching { file.readText(Charsets.UTF_8).trim() }.getOrNull()
                         runCatching { file.delete() }
@@ -598,23 +611,35 @@ class StandaloneEngineManager(
     }
 
     private fun ensureBrowserShims() {
+        val defaultSpool = browserSpoolDir.absolutePath
         val script = """#!/system/bin/sh
-URL="${'$'}1"
+URL=""
+for arg in "${'$'}@"; do
+  case "${'$'}arg" in
+    http://*|https://*)
+      URL="${'$'}arg"
+      break
+      ;;
+  esac
+done
 if [ -z "${'$'}URL" ]; then
   echo "Usage: ${'$'}0 <url>" >&2
   exit 1
 fi
-if [ -n "${'$'}TMPDIR" ]; then
-  SPOOL_DIR="${'$'}TMPDIR/browser_open"
-  mkdir -p "${'$'}SPOOL_DIR" 2>/dev/null
-  if printf '%s\n' "${'$'}URL" > "${'$'}SPOOL_DIR/req_${'$'}${'$'}.url" 2>/dev/null; then
-    exit 0
-  fi
+SPOOL_DIR="${'$'}{TMPDIR:-$defaultSpool}/browser_open"
+if [ "${'$'}SPOOL_DIR" = "/browser_open" ]; then
+  SPOOL_DIR="$defaultSpool"
+fi
+mkdir -p "${'$'}SPOOL_DIR" 2>/dev/null
+TMP_FILE="${'$'}SPOOL_DIR/.req_${'$'}${'$'}.tmp"
+URL_FILE="${'$'}SPOOL_DIR/req_${'$'}${'$'}.url"
+if printf '%s\n' "${'$'}URL" > "${'$'}TMP_FILE" 2>/dev/null && mv "${'$'}TMP_FILE" "${'$'}URL_FILE" 2>/dev/null; then
+  exit 0
 fi
 if [ -n "${'$'}AGY_BROWSER_PORT" ]; then
   CURL_BIN="${'$'}{PREFIX}/bin/curl"
   if [ -x "${'$'}CURL_BIN" ]; then
-    "${'$'}CURL_BIN" -sS -f -X POST --data-binary "${'$'}URL" "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/open" >/dev/null
+    "${'$'}CURL_BIN" --noproxy '*' -sS -f -X POST --data-binary "${'$'}URL" "http://127.0.0.1:${'$'}AGY_BROWSER_PORT/open" >/dev/null
     exit ${'$'}?
   fi
   NODE_BIN="${'$'}{PREFIX}/bin/node"
@@ -625,7 +650,16 @@ fi
 echo "Browser bridge not available for: ${'$'}URL" >&2
 exit 1
 """
-        listOf("xdg-open", "termux-open-url", "open").forEach { name ->
+        listOf(
+            "xdg-open",
+            "termux-open-url",
+            "open",
+            "sensible-browser",
+            "x-www-browser",
+            "www-browser",
+            "gnome-open",
+            "gio"
+        ).forEach { name ->
             val shimFile = File(usrDir, "bin/$name")
             runCatching {
                 shimFile.parentFile?.mkdirs()
