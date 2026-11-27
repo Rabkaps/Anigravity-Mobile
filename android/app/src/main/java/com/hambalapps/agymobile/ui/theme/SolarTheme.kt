@@ -9,9 +9,10 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.core.content.ContextCompat
 import java.time.Instant
-import java.time.LocalTime
+import java.time.ZoneId
 import java.time.ZoneOffset
 import kotlin.math.PI
 import kotlin.math.acos
@@ -430,7 +431,9 @@ fun resolveSolarColorScheme(
     }
 
     // Smooth continuous wall-clock fallback across 8 circadian anchors
-    val now = LocalTime.now()
+    val now = Instant.ofEpochMilli(epochMillis)
+        .atZone(ZoneId.systemDefault())
+        .toLocalTime()
     val hour = now.hour + now.minute / 60f
 
     return when {
@@ -489,7 +492,30 @@ private fun blendPhases(
 ): Pair<SolarPhase, ColorScheme> {
     val t = smoothstep(rawFraction)
     val activePhase = if (t < 0.5f) fromPhase else toPhase
-    return activePhase to lerpColorScheme(fromScheme, toScheme, t)
+    val blended = lerpColorScheme(fromScheme, toScheme, t)
+    // Avoid dark<->light midpoint gray-on-gray text when one scheme is dark and the other is light:
+    // keep high-contrast foreground tokens from the dominant phase while smoothly interpolating surfaces.
+    val fromIsLight = fromScheme.background.luminance() > 0.5f
+    val toIsLight = toScheme.background.luminance() > 0.5f
+    val safeScheme = if (fromIsLight != toIsLight) {
+        val dominant = if (t < 0.5f) fromScheme else toScheme
+        blended.copy(
+            onPrimary = dominant.onPrimary,
+            onPrimaryContainer = dominant.onPrimaryContainer,
+            onSecondary = dominant.onSecondary,
+            onSecondaryContainer = dominant.onSecondaryContainer,
+            onTertiary = dominant.onTertiary,
+            onTertiaryContainer = dominant.onTertiaryContainer,
+            onBackground = dominant.onBackground,
+            onSurface = dominant.onSurface,
+            onSurfaceVariant = dominant.onSurfaceVariant,
+            onError = dominant.onError,
+            onErrorContainer = dominant.onErrorContainer
+        )
+    } else {
+        blended
+    }
+    return activePhase to safeScheme
 }
 
 private fun smoothstep(t: Float): Float {
@@ -543,6 +569,10 @@ private fun lerpColorScheme(a: ColorScheme, b: ColorScheme, fraction: Float): Co
         surfaceContainerLow = lerp(a.surfaceContainerLow, b.surfaceContainerLow, t),
         surfaceContainer = lerp(a.surfaceContainer, b.surfaceContainer, t),
         surfaceContainerHigh = lerp(a.surfaceContainerHigh, b.surfaceContainerHigh, t),
-        surfaceContainerHighest = lerp(a.surfaceContainerHighest, b.surfaceContainerHighest, t)
+        surfaceContainerHighest = lerp(a.surfaceContainerHighest, b.surfaceContainerHighest, t),
+        error = lerp(a.error, b.error, t),
+        onError = lerp(a.onError, b.onError, t),
+        errorContainer = lerp(a.errorContainer, b.errorContainer, t),
+        onErrorContainer = lerp(a.onErrorContainer, b.onErrorContainer, t)
     )
 }

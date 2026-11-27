@@ -10,15 +10,17 @@ import android.os.Looper
 import com.hambalapps.agymobile.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URLDecoder
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 
 data class ShizukuExecResult(
@@ -35,6 +37,9 @@ object ShizukuBridge {
     private const val REQUEST_CODE = 4791
 
     @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
     private var service: IShizukuShellService? = null
 
     @Volatile
@@ -47,7 +52,13 @@ object ShizukuBridge {
     var localPort: Int = 0
         private set
 
-    private val executor = Executors.newCachedThreadPool()
+    val localToken: String by lazy {
+        ByteArray(32).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
+    }
+
+    private val executor = Executors.newCachedThreadPool { r ->
+        Thread(r, "ShizukuBridge").apply { isDaemon = true }
+    }
 
     fun isBinderAlive(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
 
@@ -62,9 +73,7 @@ object ShizukuBridge {
     fun requestPermissionIfNeeded() {
         if (!isBinderAlive() || hasPermission()) return
         runCatching {
-            if (!Shizuku.isPreV11() && !Shizuku.shouldShowRequestPermissionRationale()) {
-                Shizuku.requestPermission(REQUEST_CODE)
-            } else if (!Shizuku.isPreV11()) {
+            if (!Shizuku.isPreV11()) {
                 Shizuku.requestPermission(REQUEST_CODE)
             }
         }
@@ -74,22 +83,25 @@ object ShizukuBridge {
         if (localPort > 0 && serverSocket?.isClosed == false) return localPort
         synchronized(this) {
             if (localPort > 0 && serverSocket?.isClosed == false) return localPort
-            val ss = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
-            serverSocket = ss
-            localPort = ss.localPort
-            executor.execute {
-                runCatching {
-                    while (!ss.isClosed) {
-                        val client = runCatching { ss.accept() }.getOrNull() ?: break
-                        executor.execute { runCatching { handleLocalHttp(client) } }
+            return runCatching {
+                val ss = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+                serverSocket = ss
+                localPort = ss.localPort
+                executor.execute {
+                    runCatching {
+                        while (!ss.isClosed) {
+                            val client = runCatching { ss.accept() }.getOrNull() ?: break
+                            executor.execute { runCatching { handleLocalHttp(client) } }
+                        }
                     }
                 }
-            }
-            return localPort
+                localPort
+            }.getOrDefault(0)
         }
     }
 
     private suspend fun ensureService(context: Context): IShizukuShellService? {
+        appContext = context.applicationContext
         service?.let { if (it.asBinder().pingBinder()) return it }
         if (!hasPermission()) return null
 
@@ -107,27 +119,40 @@ object ShizukuBridge {
                 val conn = object : ServiceConnection {
                     override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
                         val svc = binder?.let { IShizukuShellService.Stub.asInterface(it) }
-                        service = svc
-                        pendingBind = null
+                        synchronized(this@ShizukuBridge) {
+                            service = svc
+                            if (pendingBind === def) pendingBind = null
+                        }
                         def.complete(svc)
                     }
 
                     override fun onServiceDisconnected(name: ComponentName?) {
-                        service = null
-                        pendingBind = null
+                        synchronized(this@ShizukuBridge) {
+                            service = null
+                            if (pendingBind === def) pendingBind = null
+                        }
                         if (!def.isCompleted) def.complete(null)
                     }
                 }
                 Handler(Looper.getMainLooper()).post {
                     runCatching { Shizuku.bindUserService(args, conn) }.onFailure {
-                        pendingBind = null
+                        synchronized(this@ShizukuBridge) {
+                            if (pendingBind === def) pendingBind = null
+                        }
                         if (!def.isCompleted) def.complete(null)
                     }
                 }
             }
         }
 
-        return withTimeoutOrNull(5000L) { deferred.await() }
+        val bound = withTimeoutOrNull(5000L) { deferred.await() }
+        if (bound == null) {
+            synchronized(this) {
+                if (pendingBind === deferred) pendingBind = null
+            }
+            if (!deferred.isCompleted) deferred.complete(null)
+        }
+        return bound
     }
 
     suspend fun exec(context: Context, command: String): ShizukuExecResult = withContext(Dispatchers.IO) {
@@ -151,33 +176,55 @@ object ShizukuBridge {
 
     private fun handleLocalHttp(socket: Socket) {
         socket.use { sock ->
-            val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
-            val requestLine = reader.readLine() ?: return
+            sock.soTimeout = 15_000
+            val inp = BufferedInputStream(sock.getInputStream())
+            val headerBytes = readHttpHeaderBytes(inp) ?: return
+            val headerText = String(headerBytes, Charsets.US_ASCII)
+            val lines = headerText.split("\r\n")
+            val requestLine = lines.firstOrNull() ?: return
+            val method = requestLine.substringBefore(" ").uppercase()
+            if (method != "POST") {
+                sendHttpResponse(sock, "HTTP/1.1 405 Method Not Allowed", 126, "POST required\n".toByteArray(Charsets.UTF_8))
+                return
+            }
+
             var contentLength = 0
-            while (true) {
-                val line = reader.readLine() ?: break
-                if (line.isEmpty()) break
-                if (line.startsWith("Content-Length:", ignoreCase = true)) {
-                    contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+            var providedToken = ""
+            for (line in lines.drop(1)) {
+                val colon = line.indexOf(':')
+                if (colon <= 0) continue
+                val key = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                when {
+                    key.equals("Content-Length", ignoreCase = true) -> {
+                        contentLength = value.toIntOrNull() ?: 0
+                    }
+                    key.equals("X-Agy-Token", ignoreCase = true) -> {
+                        providedToken = value
+                    }
                 }
             }
 
-            val bodyChars = CharArray(contentLength.coerceIn(0, 1_000_000))
-            var read = 0
-            while (read < bodyChars.size) {
-                val n = reader.read(bodyChars, read, bodyChars.size - read)
-                if (n <= 0) break
-                read += n
-            }
-            val body = String(bodyChars, 0, read)
-            val cmd = if (requestLine.startsWith("POST ")) {
-                body
-            } else {
-                val query = requestLine.substringAfter(" ", "").substringBefore(" ").substringAfter("cmd=", "")
-                URLDecoder.decode(query, "UTF-8")
+            if (!MessageDigest.isEqual(
+                    providedToken.toByteArray(Charsets.UTF_8),
+                    localToken.toByteArray(Charsets.UTF_8)
+                )
+            ) {
+                sendHttpResponse(sock, "HTTP/1.1 403 Forbidden", 126, "Forbidden\n".toByteArray(Charsets.UTF_8))
+                return
             }
 
-            val svc = service
+            val bodyBytes = readExactBytes(inp, contentLength.coerceIn(0, 1_000_000))
+            val cmd = String(bodyBytes, Charsets.UTF_8)
+
+            var svc = service
+            if (svc == null || !runCatching { svc.asBinder().pingBinder() }.getOrDefault(false)) {
+                val ctx = appContext
+                if (ctx != null && hasPermission()) {
+                    svc = runCatching { runBlocking { ensureService(ctx) } }.getOrNull()
+                }
+            }
+
             val (exitCode, outText) = if (svc != null && runCatching { svc.asBinder().pingBinder() }.getOrDefault(false)) {
                 runCatching {
                     val b = svc.exec(cmd)
@@ -194,14 +241,49 @@ object ShizukuBridge {
 
             val bytes = outText.toByteArray(Charsets.UTF_8)
             val statusLine = if (exitCode == 0) "HTTP/1.1 200 OK" else "HTTP/1.1 500 Command Failed"
-            val header = "$statusLine\r\nX-Exit-Code: $exitCode\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
-            sock.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
-            sock.getOutputStream().write(bytes)
-            sock.getOutputStream().flush()
+            sendHttpResponse(sock, statusLine, exitCode, bytes)
         }
     }
 
+    private fun sendHttpResponse(sock: Socket, statusLine: String, exitCode: Int, body: ByteArray) {
+        val header = "$statusLine\r\nX-Exit-Code: $exitCode\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
+        sock.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
+        sock.getOutputStream().write(body)
+        sock.getOutputStream().flush()
+    }
+
+    private fun readHttpHeaderBytes(inp: BufferedInputStream): ByteArray? {
+        val out = ByteArrayOutputStream(512)
+        var state = 0
+        while (out.size() < 32_768) {
+            val b = inp.read()
+            if (b == -1) return null
+            out.write(b)
+            state = when (state) {
+                0 -> if (b == '\r'.code) 1 else 0
+                1 -> if (b == '\n'.code) 2 else if (b == '\r'.code) 1 else 0
+                2 -> if (b == '\r'.code) 3 else 0
+                3 -> if (b == '\n'.code) return out.toByteArray() else if (b == '\r'.code) 1 else 0
+                else -> 0
+            }
+        }
+        return null
+    }
+
+    private fun readExactBytes(inp: BufferedInputStream, length: Int): ByteArray {
+        if (length <= 0) return ByteArray(0)
+        val buf = ByteArray(length)
+        var off = 0
+        while (off < length) {
+            val n = inp.read(buf, off, length - off)
+            if (n <= 0) break
+            off += n
+        }
+        return if (off == length) buf else buf.copyOf(off)
+    }
+
     suspend fun warmUp(context: Context): Boolean = withContext(Dispatchers.IO) {
+        appContext = context.applicationContext
         startLocalRishServer()
         ensureService(context) != null
     }

@@ -66,12 +66,31 @@ function safeEqual(a, b) {
     return crypto.timingSafeEqual(bufA, bufB);
 }
 async function readJsonBody(req) {
+    const MAX_BYTES = 1024 * 1024;
+    let totalBytes = 0;
     const chunks = [];
     for await (const chunk of req) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += buf.length;
+        if (totalBytes > MAX_BYTES) {
+            throw Object.assign(new Error("Payload too large"), { statusCode: 413 });
+        }
+        chunks.push(buf);
     }
     const raw = Buffer.concat(chunks).toString("utf8").trim();
-    return raw ? JSON.parse(raw) : {};
+    if (!raw)
+        return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        throw Object.assign(new Error("Invalid JSON body"), { statusCode: 400 });
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw Object.assign(new Error("JSON body must be an object"), { statusCode: 400 });
+    }
+    return parsed;
 }
 function sendJson(res, status, body) {
     res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -125,7 +144,14 @@ async function main() {
             sendJson(res, 401, { error: "Unauthorized: invalid or missing Bearer token" });
             return;
         }
-        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+        let url;
+        try {
+            url = new URL(req.url || "/", "http://localhost");
+        }
+        catch {
+            sendJson(res, 400, { error: "Invalid request URL" });
+            return;
+        }
         try {
             if (req.method === "GET" && url.pathname === "/health") {
                 const [agyVersion, privilegeLevel] = await Promise.all([
@@ -192,14 +218,19 @@ async function main() {
             sendJson(res, 404, { error: "Not found" });
         }
         catch (err) {
+            const typed = err;
+            const status = typeof typed?.statusCode === "number" ? typed.statusCode : 500;
             const message = err instanceof Error ? err.message : "Internal server error";
-            sendJson(res, 500, { error: message });
+            sendJson(res, status, { error: message });
         }
     });
-    const acpWss = new WebSocketServer({ noServer: true });
-    const ptyWss = new WebSocketServer({ noServer: true });
+    const acpWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
+    const ptyWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     acpWss.on("connection", (ws) => {
         acpClients.add(ws);
+        ws.on("error", () => {
+            acpClients.delete(ws);
+        });
         try {
             acpManager.ensureStarted();
         }
@@ -237,6 +268,18 @@ async function main() {
             env: { ...process.env, TERM: "xterm-256color" },
             stdio: ["pipe", "pipe", "pipe"],
         });
+        ws.on("error", () => {
+            // Handled on close
+        });
+        shellProc.stdin.on("error", () => {
+            // Ignore EPIPE on shell exit
+        });
+        shellProc.on("error", (err) => {
+            if (ws.readyState === ws.OPEN) {
+                ws.send(`\r\n[shell error: ${err.message}]\r\n`);
+                ws.close();
+            }
+        });
         const forwardOut = (chunk) => {
             if (ws.readyState === ws.OPEN) {
                 ws.send(chunk.toString("utf8"));
@@ -257,16 +300,48 @@ async function main() {
             }
         });
         ws.on("close", () => {
-            shellProc.kill("SIGTERM");
+            runCleanupShell(shellProc);
         });
     });
+    function runCleanupShell(shellProc) {
+        try {
+            shellProc.stdin?.end();
+        }
+        catch {
+            // ignore
+        }
+        try {
+            shellProc.kill("SIGHUP");
+        }
+        catch {
+            // ignore
+        }
+        const timer = setTimeout(() => {
+            try {
+                if (!shellProc.killed)
+                    shellProc.kill("SIGKILL");
+            }
+            catch {
+                // ignore
+            }
+        }, 1000);
+        timer.unref();
+    }
     server.on("upgrade", (req, socket, head) => {
         if (!isAuthorized(req, token)) {
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
             return;
         }
-        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+        let url;
+        try {
+            url = new URL(req.url || "/", "http://localhost");
+        }
+        catch {
+            socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+            socket.destroy();
+            return;
+        }
         if (url.pathname === "/acp") {
             acpWss.handleUpgrade(req, socket, head, (ws) => {
                 acpWss.emit("connection", ws, req);

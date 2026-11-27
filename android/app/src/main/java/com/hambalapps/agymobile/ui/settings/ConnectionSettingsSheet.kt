@@ -50,11 +50,13 @@ fun ConnectionSettingsSheet(
     bootstrapStatus: String?,
     standaloneInstalled: Boolean = false,
     standaloneToolchainInstalled: Boolean = false,
+    standaloneAndroidSdkInstalled: Boolean = false,
     standaloneProgress: Float? = null,
     detectedAbi: String = "",
     onStartStandaloneEngine: (includeToolchain: Boolean) -> Unit = {},
     onUpdateStandaloneAgy: () -> Unit = {},
     onInstallToolchain: () -> Unit = {},
+    onInstallAndroidSdk: () -> Unit = {},
     onSaveProfile: (ConnectionProfile) -> Unit,
     onDeleteProfile: (String) -> Unit,
     onSelectProfile: (String) -> Unit,
@@ -75,7 +77,7 @@ fun ConnectionSettingsSheet(
     }
     var useTls by remember(active?.id) { mutableStateOf(active?.useTls ?: false) }
     var isRemote by remember(active?.id) { mutableStateOf(active?.isRemote ?: false) }
-    var isStandalone by remember(active?.id) { mutableStateOf(active?.isStandalone ?: false) }
+    var isStandalone by remember(active?.id) { mutableStateOf(active?.isStandalone ?: true) }
 
     fun currentDraft(): ConnectionProfile = ConnectionProfile(
         id = editingId,
@@ -190,6 +192,22 @@ fun ConnectionSettingsSheet(
                             shape = M3ExpressiveShape.Full
                         ) {
                             Text("Check & Update agy CLI")
+                        }
+                        OutlinedButton(
+                            onClick = onInstallAndroidSdk,
+                            enabled = !isBootstrapping,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 44.dp),
+                            shape = M3ExpressiveShape.Full
+                        ) {
+                            Text(
+                                if (standaloneAndroidSdkInstalled) {
+                                    "Reinstall Android Build SDK (JDK 17 + API 35)"
+                                } else {
+                                    "Install Android Build SDK (JDK 17 + API 35)"
+                                }
+                            )
                         }
                     }
                 }
@@ -389,7 +407,13 @@ fun ConnectionSettingsSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Remote Host Mode", style = MaterialTheme.typography.bodyLarge)
-                Switch(checked = isRemote, onCheckedChange = { isRemote = it })
+                Switch(
+                    checked = isRemote,
+                    onCheckedChange = {
+                        isRemote = it
+                        if (it) isStandalone = false
+                    }
+                )
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),

@@ -137,6 +137,11 @@ fun AgentsAndMcpSheet(
                 }
             }
 
+            var globalDraft by remember(globalRulesText) { mutableStateOf(globalRulesText) }
+            var wsDraft by remember(workspaceRulesText) { mutableStateOf(workspaceRulesText) }
+            var newSkillName by remember { mutableStateOf("") }
+            var newSkillBody by remember { mutableStateOf("") }
+
             when (selectedTab) {
                 0 -> {
                     OutlinedTextField(
@@ -464,11 +469,6 @@ fun AgentsAndMcpSheet(
                 }
 
                 2 -> {
-                    var globalDraft by remember(globalRulesText) { mutableStateOf(globalRulesText) }
-                    var wsDraft by remember(workspaceRulesText) { mutableStateOf(workspaceRulesText) }
-                    var newSkillName by remember { mutableStateOf("") }
-                    var newSkillBody by remember { mutableStateOf("") }
-
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
                         shape = M3ExpressiveShape.Large,

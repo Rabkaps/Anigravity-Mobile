@@ -9,7 +9,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -17,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -35,6 +38,7 @@ import java.io.File
 import java.io.OutputStreamWriter
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Direct stdio JSON-RPC 2.0 host for `agy acp` inside Agy Mobile's own sandbox,
@@ -58,6 +62,9 @@ class LocalAcpClient(
     @Volatile
     private var proc: Process? = null
     private var stdinWriter: BufferedWriter? = null
+    private val sessionGeneration = AtomicLong(0L)
+    @Volatile
+    private var processJob: Job? = null
     private var activeCwd: String = engineManager.homeDir.absolutePath
     private var activeExtraDirs: List<String> = emptyList()
     private val envOverrides = ConcurrentHashMap<String, String>()
@@ -75,13 +82,14 @@ class LocalAcpClient(
             return
         }
 
+        val gen = sessionGeneration.incrementAndGet()
         val targetDir = cwd?.takeIf { it.isNotBlank() && File(it).exists() }?.let(::File)
             ?: engineManager.homeDir.also { it.mkdirs() }
         activeCwd = targetDir.absolutePath
         activeExtraDirs = extraDirs.map { it.trim() }.filter { it.isNotBlank() }.distinct()
         _connectionState.value = BridgeConnectionState.CONNECTING
 
-        scope.launch {
+        processJob = scope.launch {
             runCatching {
                 val acpArgs = buildList {
                     add("acp")
@@ -99,7 +107,13 @@ class LocalAcpClient(
                 pb.environment().putAll(engineManager.buildChildEnvironment())
                 pb.environment().putAll(envOverrides)
 
+                if (sessionGeneration.get() != gen) return@launch
                 val started = pb.start()
+                if (sessionGeneration.get() != gen) {
+                    runCatching { started.destroyForcibly() }
+                    return@launch
+                }
+
                 proc = started
                 synchronized(writeLock) {
                     stdinWriter = BufferedWriter(OutputStreamWriter(started.outputStream, Charsets.UTF_8))
@@ -109,11 +123,13 @@ class LocalAcpClient(
                 launch {
                     runCatching {
                         started.errorStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                            reader.forEachLine { line ->
-                                if (line.contains("FATAL", ignoreCase = true) ||
-                                    line.contains("panic:", ignoreCase = true)
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (sessionGeneration.get() == gen &&
+                                    (line.contains("FATAL", ignoreCase = true) ||
+                                        line.contains("panic:", ignoreCase = true))
                                 ) {
-                                    _events.tryEmit(AcpClientEvent.BridgeNotice(line))
+                                    _events.emit(AcpClientEvent.BridgeNotice(line))
                                 }
                             }
                         }
@@ -121,7 +137,9 @@ class LocalAcpClient(
                 }
 
                 started.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                    reader.forEachLine { rawLine ->
+                    while (true) {
+                        val rawLine = reader.readLine() ?: break
+                        if (sessionGeneration.get() != gen) break
                         val line = rawLine.trim()
                         if (line.isNotEmpty()) {
                             runCatching { handleIncoming(line) }
@@ -130,36 +148,56 @@ class LocalAcpClient(
                 }
 
                 val exitCode = started.waitFor()
-                failAllPending("agy acp exited ($exitCode)")
-                if (proc === started) {
+                if (proc === started && sessionGeneration.get() == gen) {
                     proc = null
                     synchronized(writeLock) { stdinWriter = null }
+                    failAllPending("agy acp exited ($exitCode)")
                     _connectionState.value = BridgeConnectionState.DISCONNECTED
-                    _events.tryEmit(AcpClientEvent.BridgeNotice("Standalone agy acp exited ($exitCode)"))
+                    _events.emit(AcpClientEvent.BridgeNotice("Standalone agy acp exited ($exitCode)"))
                 }
             }.onFailure { err ->
-                failAllPending(err.message ?: "Failed to start agy acp")
-                _connectionState.value = BridgeConnectionState.ERROR
-                _events.tryEmit(
-                    AcpClientEvent.BridgeNotice("Standalone agy launch failed: ${err.message}")
-                )
+                if (sessionGeneration.get() == gen) {
+                    failAllPending(err.message ?: "Failed to start agy acp")
+                    _connectionState.value = BridgeConnectionState.ERROR
+                    _events.emit(
+                        AcpClientEvent.BridgeNotice("Standalone agy launch failed: ${err.message}")
+                    )
+                }
             }
         }
     }
 
     fun disconnect() {
+        sessionGeneration.incrementAndGet()
+        processJob?.cancel()
+        processJob = null
         val current = proc
         proc = null
         synchronized(writeLock) {
             runCatching { stdinWriter?.close() }
             stdinWriter = null
         }
-        runCatching { current?.destroy() }
+        if (current != null) {
+            runCatching {
+                current.destroy()
+                if (current.isAlive) {
+                    scope.launch {
+                        kotlinx.coroutines.delay(500L)
+                        if (current.isAlive) runCatching { current.destroyForcibly() }
+                    }
+                }
+            }
+        }
         failAllPending("Disconnected")
         _connectionState.value = BridgeConnectionState.DISCONNECTED
     }
 
-    private fun handleIncoming(raw: String) {
+    fun close() {
+        disconnect()
+        scope.cancel()
+    }
+
+    private suspend fun handleIncoming(raw: String) {
         val envelope = runCatching { json.decodeFromString<JsonRpcEnvelope>(raw) }.getOrNull() ?: return
 
         if (envelope.id != null && envelope.id !is JsonNull && envelope.method == null) {
@@ -177,18 +215,18 @@ class LocalAcpClient(
 
         if (envelope.id != null && envelope.method == "session/request_permission" && envelope.params != null) {
             val parsed = AcpParser.parsePermissionRequest(envelope.id, envelope.params)
-            _events.tryEmit(AcpClientEvent.PermissionRequested(parsed))
+            _events.emit(AcpClientEvent.PermissionRequested(parsed))
             return
         }
         if (envelope.id != null && envelope.method == "elicitation/create" && envelope.params != null) {
             val parsed = AcpParser.parseElicitationRequest(envelope.id, envelope.params)
-            _events.tryEmit(AcpClientEvent.ElicitationRequested(parsed))
+            _events.emit(AcpClientEvent.ElicitationRequested(parsed))
             return
         }
 
         if (envelope.method == "session/update" && envelope.params != null) {
             AcpParser.parseSessionUpdate(envelope.params)?.let { ev ->
-                _events.tryEmit(AcpClientEvent.SessionUpdate(ev))
+                _events.emit(AcpClientEvent.SessionUpdate(ev))
             }
         }
     }
@@ -197,10 +235,7 @@ class LocalAcpClient(
         method: String,
         params: JsonObject,
         timeoutMs: Long = 120_000L
-    ): JsonElement {
-        val writer = synchronized(writeLock) { stdinWriter }
-            ?: throw IllegalStateException("Standalone agy acp is not running")
-
+    ): JsonElement = withContext(Dispatchers.IO) {
         val finalParams = maybeInjectSystemPrompt(method, maybeInjectAndroidMcp(method, params))
         val idNum = nextId.getAndIncrement()
         val idKey = idNum.toString()
@@ -216,6 +251,7 @@ class LocalAcpClient(
 
         runCatching {
             synchronized(writeLock) {
+                val writer = stdinWriter ?: throw IllegalStateException("Standalone agy acp is not running")
                 writer.write(payload)
                 writer.newLine()
                 writer.flush()
@@ -225,8 +261,12 @@ class LocalAcpClient(
             throw IllegalStateException("Failed to write to agy acp: ${err.message}")
         }
 
-        return withTimeout(timeoutMs) {
-            deferred.await()
+        try {
+            withTimeout(timeoutMs) {
+                deferred.await()
+            }
+        } finally {
+            pending.remove(idKey)
         }
     }
 
@@ -236,24 +276,26 @@ class LocalAcpClient(
             put("method", method)
             put("params", params)
         }.toString()
-        writeRawLine(payload)
+        writeRawLineAsync(payload)
     }
 
     fun sendPermissionReply(rpcId: JsonElement, optionId: String?) {
-        writeRawLine(AcpParser.buildPermissionResponse(rpcId, optionId).toString())
+        writeRawLineAsync(AcpParser.buildPermissionResponse(rpcId, optionId).toString())
     }
 
     fun sendElicitationReply(rpcId: JsonElement, action: String, content: Map<String, String> = emptyMap()) {
-        writeRawLine(AcpParser.buildElicitationResponse(rpcId, action, content).toString())
+        writeRawLineAsync(AcpParser.buildElicitationResponse(rpcId, action, content).toString())
     }
 
-    private fun writeRawLine(line: String) {
-        synchronized(writeLock) {
-            val writer = stdinWriter ?: return
-            runCatching {
-                writer.write(line)
-                writer.newLine()
-                writer.flush()
+    private fun writeRawLineAsync(line: String) {
+        scope.launch {
+            synchronized(writeLock) {
+                val writer = stdinWriter ?: return@synchronized
+                runCatching {
+                    writer.write(line)
+                    writer.newLine()
+                    writer.flush()
+                }
             }
         }
     }

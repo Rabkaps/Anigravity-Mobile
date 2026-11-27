@@ -3,6 +3,7 @@ package com.hambalapps.agymobile.data.engine
 import com.hambalapps.agymobile.data.acp.ModelQuotaInfo
 import com.hambalapps.agymobile.data.acp.QuotaBucketInfo
 import com.hambalapps.agymobile.data.acp.QuotaSummaryResponse
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -30,7 +31,7 @@ class QuotaClient(
     private val effortSuffixRegex = Regex("-(minimal|low|medium|high|xhigh|none|tiered|sonar)$", RegexOption.IGNORE_CASE)
 
     suspend fun fetchQuota(homeDir: File): QuotaSummaryResponse = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val tokenFile = File(homeDir, ".gemini/antigravity-cli/antigravity-oauth-token")
             if (!tokenFile.exists()) {
                 return@withContext QuotaSummaryResponse(
@@ -94,7 +95,9 @@ class QuotaClient(
                     error = errorMsg
                 )
             }
-        }.getOrElse { err ->
+        } catch (e: CancellationException) {
+            throw e
+        } catch (err: Throwable) {
             QuotaSummaryResponse(
                 ok = false,
                 error = err.message ?: "Failed to load quota"

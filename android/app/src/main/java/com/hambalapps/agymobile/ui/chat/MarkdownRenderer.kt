@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ContentCopy
@@ -134,40 +135,48 @@ fun MarkdownText(
     val codeFg = MaterialTheme.colorScheme.primary
     val linkColor = MaterialTheme.colorScheme.primary
 
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        blocks.forEach { block ->
-            when (block) {
-                is MarkdownBlock.Heading -> {
-                    val style = when (block.level) {
-                        1 -> MaterialTheme.typography.titleLarge
-                        2 -> MaterialTheme.typography.titleMedium
-                        else -> MaterialTheme.typography.labelLarge
+    SelectionContainer {
+        Column(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            blocks.forEach { block ->
+                when (block) {
+                    is MarkdownBlock.Heading -> {
+                        val style = when (block.level) {
+                            1 -> MaterialTheme.typography.titleLarge
+                            2 -> MaterialTheme.typography.titleMedium
+                            else -> MaterialTheme.typography.labelLarge
+                        }
+                        val dir = remember(block.text) { detectTextDirection(block.text) }
+                        val styled = remember(block.text, codeBg, codeFg, linkColor) {
+                            buildInlineStyled(block.text, codeBg, codeFg, linkColor)
+                        }
+                        Text(
+                            text = styled,
+                            style = style.copy(textDirection = dir),
+                            textAlign = TextAlign.Start,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
-                    val dir = detectTextDirection(block.text)
-                    Text(
-                        text = buildInlineStyled(block.text, codeBg, codeFg, linkColor),
-                        style = style.copy(textDirection = dir),
-                        textAlign = TextAlign.Start,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                is MarkdownBlock.Paragraph -> {
-                    val dir = detectTextDirection(block.text)
-                    Text(
-                        text = buildInlineStyled(block.text, codeBg, codeFg, linkColor),
-                        style = MaterialTheme.typography.bodyLarge.copy(textDirection = dir),
-                        textAlign = TextAlign.Start,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                is MarkdownBlock.CodeFence -> {
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                        CodeFenceCard(language = block.language, code = block.code)
+                    is MarkdownBlock.Paragraph -> {
+                        val dir = remember(block.text) { detectTextDirection(block.text) }
+                        val styled = remember(block.text, codeBg, codeFg, linkColor) {
+                            buildInlineStyled(block.text, codeBg, codeFg, linkColor)
+                        }
+                        Text(
+                            text = styled,
+                            style = MaterialTheme.typography.bodyLarge.copy(textDirection = dir),
+                            textAlign = TextAlign.Start,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    is MarkdownBlock.CodeFence -> {
+                        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                            CodeFenceCard(language = block.language, code = block.code)
+                        }
                     }
                 }
             }
@@ -364,9 +373,10 @@ private fun AnnotatedString.Builder.appendInlineStyled(
                     append(input[i++])
                 }
             }
-            input.startsWith("*", i) -> {
+            !input.startsWith("**", i) && input.startsWith("*", i) -> {
                 val end = input.indexOf('*', i + 1)
-                if (end > i + 1) {
+                val lineBreak = input.indexOf('\n', i + 1)
+                if (end > i + 1 && (lineBreak == -1 || end < lineBreak)) {
                     withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
                         appendInlineStyled(input.substring(i + 1, end), inlineCodeBg, inlineCodeFg, linkColor)
                     }

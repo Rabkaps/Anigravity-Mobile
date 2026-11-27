@@ -1,8 +1,6 @@
 package com.hambalapps.agymobile.ui.chat
 
 import android.app.Application
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -29,14 +27,19 @@ import com.hambalapps.agymobile.data.local.LocalProject
 import com.hambalapps.agymobile.data.local.SettingsRepository
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
 import kotlinx.serialization.json.JsonArray
@@ -62,10 +65,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val bridgeApi = BridgeApiClient()
     val ptyClient = PtyWebSocketClient()
 
+    sealed interface UiEffect {
+        data object LaunchVoiceInput : UiEffect
+        data object OpenSessionsDrawer : UiEffect
+    }
+
     private val _uiState = MutableStateFlow(
         ChatUiState(
             standaloneInstalled = engineManager.isAgyInstalled(),
             standaloneToolchainInstalled = engineManager.isToolchainInstalled(),
+            standaloneAndroidSdkInstalled = engineManager.isAndroidSdkInstalled(),
             standaloneSignedIn = engineManager.isSignedIn(),
             standaloneAgyVersion = engineManager.installedAgyVersion(),
             detectedAbi = engineManager.detectArch().abi
@@ -73,13 +82,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
-    var onRequestVoiceInput: (() -> Unit)? = null
+    private val _uiEffects = MutableSharedFlow<UiEffect>(extraBufferCapacity = 16)
+    val uiEffects: SharedFlow<UiEffect> = _uiEffects.asSharedFlow()
 
     private var lastConnectedProfileKey: String? = null
     private var activeAgentMessageId: String? = null
     private var activeUserMessageId: String? = null
     private var activePromptJob: Job? = null
+    private var sessionLoadJob: Job? = null
+    private var btwJob: Job? = null
     private var turnGeneration: Long = 0L
+    @Volatile
+    private var acceptingStreamUpdates: Boolean = false
+    @Volatile
+    private var loadingSessionId: String? = null
+    @Volatile
+    private var btwSessionId: String? = null
 
     private val terminalTaskStatuses = setOf("completed", "failed", "error", "cancelled", "done")
 
@@ -232,6 +250,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         when (event) {
             is AcpClientEvent.SessionUpdate -> handleSessionUpdate(event.event)
             is AcpClientEvent.PermissionRequested -> {
+                val reqSid = event.request.sessionId
+                if (btwSessionId != null && reqSid == btwSessionId) {
+                    acpPermissionReply(event.request.rpcId, null)
+                    return
+                }
+                val curSid = _uiState.value.sessionId
+                if (reqSid.isNotEmpty() && curSid != null && reqSid != curSid) return
                 val policy = _uiState.value.preferences?.permissionPolicy ?: "request_review"
                 val kindLower = event.request.kind.lowercase()
                 val autoOptionId = event.request.options.firstOrNull {
@@ -251,6 +276,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is AcpClientEvent.ElicitationRequested -> {
+                val reqSid = event.request.sessionId
+                val curSid = _uiState.value.sessionId
+                if (reqSid.isNotEmpty() && curSid != null && reqSid != curSid) return
                 _uiState.update {
                     it.copy(elicitationQueue = it.elicitationQueue + event.request)
                 }
@@ -638,8 +666,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 spec.sheetTrigger?.let { openSheetForTrigger(it) }
             }
             SlashCommandTarget.LOCAL_ACTION -> {
-                _uiState.update { it.copy(composerText = "") }
-                executeLocalAction(spec.command)
+                if (spec.argHint != null) {
+                    _uiState.update { it.copy(composerText = "${spec.command} ") }
+                } else {
+                    _uiState.update { it.copy(composerText = "") }
+                    executeLocalAction(spec.command)
+                }
             }
             SlashCommandTarget.AGENT_PROMPT -> {
                 val suffix = if (spec.argHint != null) " " else ""
@@ -651,16 +683,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun openSheetForTrigger(trigger: LocalSheetTrigger) {
         when (trigger) {
             LocalSheetTrigger.MODE_MODEL -> openSheet(ActiveSheet.MODE_MODEL)
-            LocalSheetTrigger.DIFF -> {
-                refreshDiff()
-                openSheet(ActiveSheet.DIFF)
-            }
+            LocalSheetTrigger.DIFF -> openSheet(ActiveSheet.DIFF)
             LocalSheetTrigger.ARTIFACT -> openSheet(ActiveSheet.ARTIFACT)
-            LocalSheetTrigger.AGENTS_MCP -> {
-                refreshConfig()
-                openSheet(ActiveSheet.AGENTS_MCP)
+            LocalSheetTrigger.AGENTS_MCP -> openSheet(ActiveSheet.AGENTS_MCP)
+            LocalSheetTrigger.SESSIONS -> {
+                refreshSessions()
+                _uiEffects.tryEmit(UiEffect.OpenSessionsDrawer)
             }
-            LocalSheetTrigger.SESSIONS -> refreshSessions()
             LocalSheetTrigger.TERMINAL -> openTerminalSheet()
             LocalSheetTrigger.SETTINGS -> openSheet(ActiveSheet.SETTINGS)
         }
@@ -671,12 +700,128 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         when (cmd) {
             "/clear", "/new" -> startFreshChat()
             "/fork", "/branch" -> forkConversation()
-            "/voice" -> onRequestVoiceInput?.invoke()
+            "/voice" -> _uiEffects.tryEmit(UiEffect.LaunchVoiceInput)
             "/logout" -> logoutFromAgent()
             "/add-dir" -> {
                 val arg = rawCommand.trim().substringAfter(' ', "").trim()
                 if (arg.isNotEmpty()) {
                     addWorkspaceDir(arg)
+                }
+            }
+            "/btw" -> {
+                val arg = rawCommand.trim().substringAfter(' ', "").trim()
+                if (arg.isNotEmpty()) {
+                    askBtwSideQuestion(arg)
+                }
+            }
+        }
+    }
+
+    fun dismissBtwSideNote() {
+        btwJob?.cancel()
+        btwJob = null
+        val sid = btwSessionId
+        btwSessionId = null
+        if (sid != null) {
+            acpNotify(
+                method = "session/cancel",
+                params = buildJsonObject { put("sessionId", sid) }
+            )
+        }
+        _uiState.update { it.copy(btwSideNote = null) }
+    }
+
+    private fun askBtwSideQuestion(question: String) {
+        btwJob?.cancel()
+        val prevSid = btwSessionId
+        btwSessionId = null
+        if (prevSid != null) {
+            acpNotify(
+                method = "session/cancel",
+                params = buildJsonObject { put("sessionId", prevSid) }
+            )
+        }
+        _uiState.update {
+            it.copy(btwSideNote = BtwSideNoteUi(question = question, isLoading = true))
+        }
+        if (_uiState.value.connectionState != BridgeConnectionState.CONNECTED) {
+            _uiState.update {
+                it.copy(
+                    btwSideNote = BtwSideNoteUi(
+                        question = question,
+                        isLoading = false,
+                        error = "Connect to the engine first to use /btw."
+                    )
+                )
+            }
+            return
+        }
+        val cwd = _uiState.value.workspaceCwd
+        val contextSnippet = _uiState.value.messages
+            .takeLast(6)
+            .joinToString("\n") { m ->
+                val role = if (m.role == MessageRole.USER) "User" else "Assistant"
+                "$role: ${m.text.take(500)}"
+            }
+        val fullPrompt = buildString {
+            if (contextSnippet.isNotBlank()) {
+                appendLine("Recent conversation context (read-only):")
+                appendLine(contextSnippet)
+                appendLine()
+            }
+            append("Side question (answer concisely from the context above without editing files or altering the ongoing task): ")
+            append(question)
+        }
+        btwJob = viewModelScope.launch {
+            var ephemeralId: String? = null
+            try {
+                val res = acpRequest(
+                    method = "session/new",
+                    params = buildJsonObject {
+                        put("cwd", cwd)
+                        put("mcpServers", JsonArray(emptyList()))
+                    }
+                )
+                ephemeralId = AcpParser.parseSessionSetupResult(res).sessionId.takeIf { it.isNotBlank() }
+                    ?: error("Could not start side-question session.")
+                btwSessionId = ephemeralId
+                acpRequest(
+                    method = "session/prompt",
+                    params = buildJsonObject {
+                        put("sessionId", ephemeralId)
+                        put(
+                            "prompt",
+                            buildJsonArray {
+                                add(buildJsonObject {
+                                    put("type", "text")
+                                    put("text", fullPrompt)
+                                })
+                            }
+                        )
+                    },
+                    timeoutMs = 120_000L
+                )
+                if (btwSessionId == ephemeralId) {
+                    _uiState.update { state ->
+                        state.copy(btwSideNote = state.btwSideNote?.copy(isLoading = false))
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                if (ephemeralId == null || btwSessionId == ephemeralId) {
+                    _uiState.update { state ->
+                        state.copy(
+                            btwSideNote = state.btwSideNote?.copy(
+                                isLoading = false,
+                                error = err.message ?: "Side question failed"
+                            )
+                        )
+                    }
+                }
+            } finally {
+                if (ephemeralId != null && btwSessionId == ephemeralId) {
+                    btwSessionId = null
                 }
             }
         }
@@ -706,6 +851,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             emptyList()
         }
         if (raw.isEmpty() && attachments.isEmpty()) return
+
+        if (raw.startsWith("/btw", ignoreCase = true) && (raw.length == 4 || raw[4].isWhitespace())) {
+            val query = raw.substring(4).trim()
+            if (query.isEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        statusBanner = "Usage: /btw <side question>",
+                        composerText = if (overridePrompt == null) "/btw " else it.composerText
+                    )
+                }
+                return
+            }
+            if (overridePrompt == null) {
+                _uiState.update { it.copy(composerText = "") }
+            }
+            askBtwSideQuestion(query)
+            return
+        }
 
         val isTurnActive = _uiState.value.isStreaming ||
             activePromptJob?.isActive == true ||
@@ -757,6 +920,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         val agentMsg = ChatMessageUi(role = MessageRole.AGENT, isStreaming = true)
         activeAgentMessageId = agentMsg.id
+        acceptingStreamUpdates = true
         val myGen = ++turnGeneration
 
         _uiState.update { state ->
@@ -839,6 +1003,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun cancelActiveTurnInternal() {
+        acceptingStreamUpdates = false
+        turnGeneration++
+        activePromptJob?.cancel()
+        activePromptJob = null
         val sessionId = _uiState.value.sessionId
         if (sessionId != null) {
             acpNotify(
@@ -846,7 +1014,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 params = buildJsonObject { put("sessionId", sessionId) }
             )
         }
-        turnGeneration++
         settleTurnState(finalTaskStatus = "cancelled")
         AgentForegroundService.stop(getApplication())
     }
@@ -946,10 +1113,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ?.takeIf { it.isNotBlank() }
             ?: _uiState.value.workspaceCwd
         turnGeneration++
+        acceptingStreamUpdates = false
+        sessionLoadJob?.cancel()
         activePromptJob?.cancel()
         activePromptJob = null
         activeAgentMessageId = null
         activeUserMessageId = null
+        loadingSessionId = sessionId
+        AgentForegroundService.stop(getApplication())
         _uiState.update {
             it.copy(
                 messages = emptyList(),
@@ -959,46 +1130,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 statusBanner = null
             )
         }
-        viewModelScope.launch {
-            runCatching {
-                val res = acpRequest(
-                    method = "session/load",
-                    params = buildJsonObject {
-                        put("sessionId", sessionId)
-                        put("cwd", cwd)
-                        put("mcpServers", JsonArray(emptyList()))
-                    }
-                )
-                val parsed = AcpParser.parseSessionSetupResult(res)
-                activeAgentMessageId = null
-                activeUserMessageId = null
-                _uiState.update { state ->
-                    val finalizedMessages = state.messages
-                        .map { msg -> if (msg.isStreaming) msg.copy(isStreaming = false) else msg }
-                        .ifEmpty {
-                            listOf(
-                                ChatMessageUi(
-                                    role = MessageRole.SYSTEM,
-                                    text = "Resumed session $sessionId"
-                                )
-                            )
+        sessionLoadJob = viewModelScope.launch {
+            try {
+                runCatching {
+                    val res = acpRequest(
+                        method = "session/load",
+                        params = buildJsonObject {
+                            put("sessionId", sessionId)
+                            put("cwd", cwd)
+                            put("mcpServers", JsonArray(emptyList()))
                         }
-                    state.copy(
-                        sessionId = parsed.sessionId.ifBlank { sessionId },
-                        configOptions = if (parsed.configOptions.isNotEmpty()) parsed.configOptions else state.configOptions,
-                        messages = finalizedMessages,
-                        isStreaming = false
                     )
+                    val parsed = AcpParser.parseSessionSetupResult(res)
+                    activeAgentMessageId = null
+                    activeUserMessageId = null
+                    _uiState.update { state ->
+                        val finalizedMessages = state.messages
+                            .map { msg -> if (msg.isStreaming) msg.copy(isStreaming = false) else msg }
+                            .ifEmpty {
+                                listOf(
+                                    ChatMessageUi(
+                                        role = MessageRole.SYSTEM,
+                                        text = "Resumed session $sessionId"
+                                    )
+                                )
+                            }
+                        state.copy(
+                            sessionId = parsed.sessionId.ifBlank { sessionId },
+                            workspaceCwd = cwd,
+                            configOptions = if (parsed.configOptions.isNotEmpty()) parsed.configOptions else state.configOptions,
+                            messages = finalizedMessages,
+                            isStreaming = false
+                        )
+                    }
+                    refreshQuota()
+                }.onFailure { err ->
+                    activeAgentMessageId = null
+                    activeUserMessageId = null
+                    _uiState.update {
+                        it.copy(
+                            isStreaming = false,
+                            statusBanner = "Could not load session: ${err.message}"
+                        )
+                    }
                 }
-                refreshQuota()
-            }.onFailure { err ->
-                activeAgentMessageId = null
-                activeUserMessageId = null
-                _uiState.update {
-                    it.copy(
-                        isStreaming = false,
-                        statusBanner = "Could not load session: ${err.message}"
-                    )
+            } finally {
+                if (loadingSessionId == sessionId) {
+                    loadingSessionId = null
                 }
             }
         }
@@ -1008,15 +1186,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settingsRepo.setPermissionPolicy(policy)
             if (policy == "turbo") {
-                val queued = _uiState.value.permissionQueue
-                if (queued.isNotEmpty()) {
-                    _uiState.update { it.copy(permissionQueue = emptyList()) }
-                    queued.forEach { req ->
-                        val optId = req.options.firstOrNull {
-                            it.kind == "allow_always" || it.kind == "allow_once" || !it.kind.startsWith("reject")
-                        }?.optionId
-                        acpPermissionReply(req.rpcId, optId)
-                    }
+                var queued: List<AcpPermissionRequest> = emptyList()
+                _uiState.update { state ->
+                    queued = state.permissionQueue
+                    if (queued.isEmpty()) state else state.copy(permissionQueue = emptyList())
+                }
+                queued.forEach { req ->
+                    val optId = req.options.firstOrNull {
+                        it.kind == "allow_always" || it.kind == "allow_once" || !it.kind.startsWith("reject")
+                    }?.optionId
+                    acpPermissionReply(req.rpcId, optId)
                 }
             }
         }
@@ -1154,6 +1333,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     setActive = true
                 )
             }
+        }
+        if (isStandaloneActive() && engineManager.isAgyInstalled()) {
+            localAcpClient.start(_uiState.value.workspaceCwd, _uiState.value.extraDirs)
         }
     }
 
@@ -1335,9 +1517,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshConfig() {
         val profile = _uiState.value.activeProfile ?: return
         if (profile.isStandalone) {
-            val settingsFile = engineManager.cliSettingsFile
-            val text = if (settingsFile.exists()) runCatching { settingsFile.readText() }.getOrDefault("{}") else "{}"
-            _uiState.update { it.copy(bridgeSettingsJson = text) }
+            viewModelScope.launch {
+                val text = withContext(Dispatchers.IO) {
+                    val settingsFile = engineManager.cliSettingsFile
+                    if (settingsFile.exists()) runCatching { settingsFile.readText() }.getOrDefault("{}") else "{}"
+                }
+                _uiState.update { it.copy(bridgeSettingsJson = text) }
+            }
         } else {
             viewModelScope.launch {
                 bridgeApi.getConfig(profile).onSuccess { cfg ->
@@ -1482,16 +1668,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (!isStandaloneActive()) return
         viewModelScope.launch {
             runCatching {
-                val file = engineManager.cliSettingsFile
-                file.parentFile?.mkdirs()
-                val obj = if (file.exists()) {
-                    runCatching { org.json.JSONObject(file.readText()) }.getOrDefault(org.json.JSONObject())
-                } else {
-                    org.json.JSONObject()
+                val formatted = withContext(Dispatchers.IO) {
+                    val file = engineManager.cliSettingsFile
+                    file.parentFile?.mkdirs()
+                    val obj = if (file.exists()) {
+                        runCatching { org.json.JSONObject(file.readText()) }.getOrDefault(org.json.JSONObject())
+                    } else {
+                        org.json.JSONObject()
+                    }
+                    obj.put(key, enabled)
+                    val out = obj.toString(2) + "\n"
+                    file.writeText(out, Charsets.UTF_8)
+                    out
                 }
-                obj.put(key, enabled)
-                val formatted = obj.toString(2) + "\n"
-                file.writeText(formatted, Charsets.UTF_8)
                 _uiState.update {
                     it.copy(
                         bridgeSettingsJson = formatted,
@@ -1719,50 +1908,118 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             if (isStandaloneActive() && engineManager.isAgyInstalled()) {
-                localAcpClient.start(_uiState.value.workspaceCwd)
+                localAcpClient.start(_uiState.value.workspaceCwd, _uiState.value.extraDirs)
+            }
+        }
+    }
+
+    fun installAndroidBuildSdk() {
+        if (_uiState.value.isBootstrapping) return
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isBootstrapping = true,
+                    standaloneProgress = 0f,
+                    standaloneStatus = "Installing OpenJDK 17 + Android SDK…",
+                    bootstrapStatus = "Installing OpenJDK 17 + Android SDK…"
+                )
+            }
+            val res = engineManager.installAndroidBuildSdk { status, prog ->
+                _uiState.update {
+                    it.copy(
+                        standaloneStatus = status,
+                        standaloneProgress = prog,
+                        bootstrapStatus = status
+                    )
+                }
+            }
+            _uiState.update {
+                it.copy(
+                    isBootstrapping = false,
+                    standaloneToolchainInstalled = engineManager.isToolchainInstalled(),
+                    standaloneAndroidSdkInstalled = engineManager.isAndroidSdkInstalled(),
+                    standaloneProgress = if (res.isSuccess) 1f else null,
+                    standaloneStatus = if (res.isSuccess) {
+                        "Android Build SDK (JDK 17 + API 35 + aapt2) ready!"
+                    } else {
+                        "Android SDK install failed: ${res.exceptionOrNull()?.message}"
+                    },
+                    bootstrapStatus = if (res.isSuccess) {
+                        "Android Build SDK ready!"
+                    } else {
+                        "Android SDK install failed: ${res.exceptionOrNull()?.message}"
+                    }
+                )
+            }
+            if (res.isSuccess && isStandaloneActive() && engineManager.isAgyInstalled()) {
+                localAcpClient.start(_uiState.value.workspaceCwd, _uiState.value.extraDirs)
             }
         }
     }
 
     private fun handleSessionUpdate(event: AcpSessionEvent) {
+        if (btwSessionId != null && event.sessionId == btwSessionId) {
+            if (event is AcpSessionEvent.AgentMessageChunk) {
+                _uiState.update { state ->
+                    val current = state.btwSideNote ?: return@update state
+                    state.copy(btwSideNote = current.copy(answer = current.answer + event.text))
+                }
+            }
+            return
+        }
+        val currentSessionId = _uiState.value.sessionId
+        val expectedSessionId = loadingSessionId ?: currentSessionId
+        if (!expectedSessionId.isNullOrBlank() && event.sessionId.isNotBlank() && event.sessionId != expectedSessionId) {
+            return
+        }
         when (event) {
             is AcpSessionEvent.UserMessageChunk -> {
                 val prevAgentId = activeAgentMessageId
                 activeAgentMessageId = null
+                val targetUserId = activeUserMessageId ?: ChatMessageUi(role = MessageRole.USER, text = event.text).also {
+                    activeUserMessageId = it.id
+                    _uiState.update { state ->
+                        val settled = if (prevAgentId != null) {
+                            state.messages.map { m -> if (m.id == prevAgentId) m.copy(isStreaming = false) else m }
+                        } else {
+                            state.messages
+                        }
+                        state.copy(messages = settled + it, isStreaming = false)
+                    }
+                    return
+                }
                 _uiState.update { state ->
                     val settled = if (prevAgentId != null) {
                         state.messages.map { m -> if (m.id == prevAgentId) m.copy(isStreaming = false) else m }
                     } else {
                         state.messages
                     }
-                    val targetUserId = activeUserMessageId
-                    val updatedMessages = if (targetUserId == null) {
-                        val created = ChatMessageUi(role = MessageRole.USER, text = event.text)
-                        activeUserMessageId = created.id
-                        settled + created
-                    } else {
-                        settled.map { msg ->
+                    state.copy(
+                        messages = settled.map { msg ->
                             if (msg.id == targetUserId) msg.copy(text = msg.text + event.text) else msg
-                        }
-                    }
-                    state.copy(messages = updatedMessages, isStreaming = false)
+                        },
+                        isStreaming = false
+                    )
                 }
             }
             is AcpSessionEvent.AgentMessageChunk -> {
+                if (!acceptingStreamUpdates && loadingSessionId == null) return
                 activeUserMessageId = null
                 updateActiveAgentMessage { msg ->
                     val newText = msg.text + event.text
-                    msg.copy(text = newText, isStreaming = true)
+                    msg.copy(text = newText, isStreaming = loadingSessionId == null)
                 }
-                maybeCaptureArtifact()
+                if (loadingSessionId == null) maybeCaptureArtifact()
             }
             is AcpSessionEvent.AgentThoughtChunk -> {
+                if (!acceptingStreamUpdates && loadingSessionId == null) return
                 activeUserMessageId = null
                 updateActiveAgentMessage { msg ->
-                    msg.copy(thinking = msg.thinking + event.text, isStreaming = true)
+                    msg.copy(thinking = msg.thinking + event.text, isStreaming = loadingSessionId == null)
                 }
             }
             is AcpSessionEvent.ToolCallEvent -> {
+                if (!acceptingStreamUpdates && loadingSessionId == null) return
                 activeUserMessageId = null
                 updateActiveAgentMessage { msg ->
                     val updatedList = msg.toolCalls.toMutableList()
@@ -1854,16 +2111,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun updateActiveAgentMessage(transform: (ChatMessageUi) -> ChatMessageUi) {
-        _uiState.update { state ->
-            val targetId = activeAgentMessageId
-            if (targetId == null) {
-                val created = transform(ChatMessageUi(role = MessageRole.AGENT, isStreaming = true))
-                activeAgentMessageId = created.id
-                state.copy(messages = state.messages + created, isStreaming = true)
-            } else {
+        val existingId = activeAgentMessageId
+        if (existingId == null) {
+            val created = transform(ChatMessageUi(role = MessageRole.AGENT, isStreaming = loadingSessionId == null))
+            activeAgentMessageId = created.id
+            _uiState.update { state ->
+                state.copy(messages = state.messages + created, isStreaming = loadingSessionId == null)
+            }
+        } else {
+            _uiState.update { state ->
                 state.copy(
                     messages = state.messages.map { msg ->
-                        if (msg.id == targetId) transform(msg) else msg
+                        if (msg.id == existingId) transform(msg) else msg
                     }
                 )
             }
@@ -1937,6 +2196,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun finalizeAgentTurn() {
+        acceptingStreamUpdates = false
         activePromptJob = null
         val nextQueued = _uiState.value.queuedMessages.firstOrNull()
         settleTurnState(finalTaskStatus = "completed", popNextQueued = nextQueued != null)
@@ -1950,6 +2210,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendAgentError(errorText: String) {
+        acceptingStreamUpdates = false
         activePromptJob = null
         AgentForegroundService.stop(getApplication())
         settleTurnState(finalTaskStatus = "failed", errorText = errorText)
@@ -1957,13 +2218,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        btwJob?.cancel()
         AgentForegroundService.stop(getApplication())
+        loginRunner.cancel()
         runCatching {
             Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
             Shizuku.removeBinderReceivedListener(shizukuBinderListener)
         }
-        ptyClient.disconnect()
-        acpClient.disconnect()
-        localAcpClient.disconnect()
+        ptyClient.close()
+        acpClient.close()
+        localAcpClient.close()
     }
 }

@@ -8,9 +8,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
@@ -38,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.data.acp.PtyWebSocketClient
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
@@ -83,7 +87,7 @@ fun TerminalSheet(
         }
     }
 
-    LaunchedEffect(output.length) {
+    LaunchedEffect(output) {
         scrollState.animateScrollTo(scrollState.maxValue)
     }
 
@@ -95,6 +99,7 @@ fun TerminalSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .imePadding()
                 .padding(horizontal = 18.dp)
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -235,13 +240,27 @@ fun TerminalSheet(
                     onValueChange = { cmdInput = it },
                     placeholder = { Text("Enter shell command or paste auth code…") },
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(
+                        onSend = {
+                            if (cmdInput.isNotBlank()) {
+                                ptyClient.sendCommand(cmdInput)
+                                cmdInput = ""
+                            }
+                        }
+                    ),
                     modifier = Modifier.weight(1f),
                     shape = M3ExpressiveShape.Full
                 )
                 IconButton(
                     onClick = {
                         val cm = context.getSystemService(ClipboardManager::class.java)
-                        val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                        val primaryClip = cm?.primaryClip
+                        val clip = if (primaryClip != null && primaryClip.itemCount > 0) {
+                            primaryClip.getItemAt(0)?.text?.toString().orEmpty()
+                        } else {
+                            ""
+                        }
                         if (clip.isNotBlank()) {
                             cmdInput = if (cmdInput.isBlank()) clip else "$cmdInput$clip"
                         }

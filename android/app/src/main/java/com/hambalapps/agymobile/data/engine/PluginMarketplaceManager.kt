@@ -75,7 +75,9 @@ class PluginMarketplaceManager(
 
             val merged = (live + builtInCatalog)
                 .distinctBy { it.installSpec.lowercase() }
-            cachedCatalog = merged
+            if (live.isNotEmpty()) {
+                cachedCatalog = merged
+            }
             merged
         }
 
@@ -83,7 +85,7 @@ class PluginMarketplaceManager(
         withContext(Dispatchers.IO) {
             val fromCli = if (engineManager.isAgyInstalled()) {
                 runCatching {
-                    val res = runAgyCli(listOf("plugin", "list", "--json"), timeoutSec = 20L)
+                    val res = runAgyCli(listOf("plugin", "list", "--json"), timeoutSec = 20L, cwd = workspaceCwd)
                     if (res.first == 0) parsePluginListJson(res.second) else emptyList()
                 }.getOrDefault(emptyList())
             } else {
@@ -174,22 +176,30 @@ class PluginMarketplaceManager(
     }
 
     suspend fun setPluginEnabled(name: String, enabled: Boolean): Result<String> = withContext(Dispatchers.IO) {
+        val cleanName = name.trim()
+        if (cleanName.isBlank() || cleanName.startsWith("-")) {
+            return@withContext Result.failure(IllegalArgumentException("Invalid plugin name"))
+        }
         if (!engineManager.isAgyInstalled()) {
             return@withContext Result.failure(IllegalStateException("Standalone agy is not installed."))
         }
         val sub = if (enabled) "enable" else "disable"
-        val (code, out) = runAgyCli(listOf("plugin", sub, name), timeoutSec = 20L)
-        if (code == 0) Result.success(out.ifBlank { "Plugin $name ${sub}d" })
-        else Result.failure(IllegalStateException(out.ifBlank { "Failed to $sub $name ($code)" }))
+        val (code, out) = runAgyCli(listOf("plugin", sub, cleanName), timeoutSec = 20L)
+        if (code == 0) Result.success(out.ifBlank { "Plugin $cleanName ${sub}d" })
+        else Result.failure(IllegalStateException(out.ifBlank { "Failed to $sub $cleanName ($code)" }))
     }
 
     suspend fun uninstallPlugin(name: String): Result<String> = withContext(Dispatchers.IO) {
+        val cleanName = name.trim()
+        if (cleanName.isBlank() || cleanName.startsWith("-")) {
+            return@withContext Result.failure(IllegalArgumentException("Invalid plugin name"))
+        }
         if (!engineManager.isAgyInstalled()) {
             return@withContext Result.failure(IllegalStateException("Standalone agy is not installed."))
         }
-        val (code, out) = runAgyCli(listOf("plugin", "uninstall", name), timeoutSec = 20L)
-        if (code == 0) Result.success(out.ifBlank { "Uninstalled $name" })
-        else Result.failure(IllegalStateException(out.ifBlank { "Failed to uninstall $name ($code)" }))
+        val (code, out) = runAgyCli(listOf("plugin", "uninstall", cleanName), timeoutSec = 20L)
+        if (code == 0) Result.success(out.ifBlank { "Uninstalled $cleanName" })
+        else Result.failure(IllegalStateException(out.ifBlank { "Failed to uninstall $cleanName ($code)" }))
     }
 
     fun readGlobalRules(): String {
@@ -257,18 +267,27 @@ class PluginMarketplaceManager(
         base.writeText(finalContent, Charsets.UTF_8)
     }
 
-    private fun runAgyCli(args: List<String>, timeoutSec: Long): Pair<Int, String> {
+    private fun runAgyCli(args: List<String>, timeoutSec: Long, cwd: String? = null): Pair<Int, String> {
+        val workDir = cwd?.takeIf { it.isNotBlank() && File(it).isDirectory }?.let(::File)
+            ?: engineManager.homeDir
         val cmd = engineManager.buildAgyCommand(args)
         val pb = ProcessBuilder(cmd)
-            .directory(engineManager.homeDir)
+            .directory(workDir)
             .redirectErrorStream(true)
         pb.environment().putAll(engineManager.buildChildEnvironment())
         val proc = pb.start()
-        val buf = StringBuilder()
+        val buf = StringBuffer()
         val readerThread = Thread {
             runCatching {
                 proc.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                    buf.append(reader.readText())
+                    val chunk = CharArray(4096)
+                    while (true) {
+                        val n = reader.read(chunk)
+                        if (n <= 0) break
+                        if (buf.length < 512 * 1024) {
+                            buf.append(chunk, 0, n)
+                        }
+                    }
                 }
             }
         }.apply {

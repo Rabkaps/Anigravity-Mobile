@@ -20,9 +20,11 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
@@ -84,7 +86,7 @@ fun DiffViewerSheet(
                 }
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(files, key = { it.path }) { entry ->
+                    items(files, key = { "${it.status}:${it.path}" }) { entry ->
                         DiffFileCard(entry)
                     }
                 }
@@ -125,18 +127,24 @@ private fun DiffFileCard(entry: DiffFileEntry) {
             }
 
             if (entry.diff.isNotBlank()) {
-                val annotated = buildAnnotatedString {
-                    entry.diff.lines().forEach { line ->
-                        val color = when {
-                            line.startsWith("+") && !line.startsWith("+++") -> Color(0xFF4ADE80)
-                            line.startsWith("-") && !line.startsWith("---") -> Color(0xFFF87171)
-                            line.startsWith("@@") -> Color(0xFF60A5FA)
-                            else -> Color.Unspecified
-                        }
-                        if (color != Color.Unspecified) {
-                            withStyle(SpanStyle(color = color)) { appendLine(line) }
-                        } else {
-                            appendLine(line)
+                val isDark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+                val addColor = if (isDark) Color(0xFF4ADE80) else Color(0xFF15803D)
+                val delColor = if (isDark) Color(0xFFF87171) else Color(0xFFB91C1C)
+                val hunkColor = if (isDark) Color(0xFF60A5FA) else Color(0xFF1D4ED8)
+                val annotated = remember(entry.diff, isDark) {
+                    buildAnnotatedString {
+                        entry.diff.lines().forEach { line ->
+                            val color = when {
+                                line.startsWith("+") && !line.startsWith("+++") -> addColor
+                                line.startsWith("-") && !line.startsWith("---") -> delColor
+                                line.startsWith("@@") -> hunkColor
+                                else -> Color.Unspecified
+                            }
+                            if (color != Color.Unspecified) {
+                                withStyle(SpanStyle(color = color)) { appendLine(line) }
+                            } else {
+                                appendLine(line)
+                            }
                         }
                     }
                 }

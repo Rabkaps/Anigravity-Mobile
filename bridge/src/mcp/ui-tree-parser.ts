@@ -26,6 +26,14 @@ const BOUNDS_REGEX = /^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$/;
 
 function decodeXmlEntities(value: string): string {
   return value
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      const cp = Number.parseInt(hex, 16);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const cp = Number.parseInt(dec, 10);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+    })
     .replaceAll("&quot;", '"')
     .replaceAll("&apos;", "'")
     .replaceAll("&lt;", "<")
@@ -49,7 +57,7 @@ function parseAttributes(rawAttrBlock: string): Record<string, string> {
  */
 export function parseUiTreeXml(xml: string): UiTreeNode[] {
   const nodes: UiTreeNode[] = [];
-  const nodeTagRegex = /<node\s+([^>]+?)\s*\/?>/g;
+  const nodeTagRegex = /<node\s+((?:"[^"]*"|'[^']*'|[^>"'])+?)\s*\/?>/g;
   let match: RegExpExecArray | null;
   let index = 0;
 
@@ -70,11 +78,12 @@ export function parseUiTreeXml(xml: string): UiTreeNode[] {
     const resourceId = attrs["resource-id"]?.trim() || undefined;
     const clickable = attrs["clickable"] === "true";
     const scrollable = attrs["scrollable"] === "true";
+    const focusable = attrs["focusable"] === "true";
     const enabled = attrs["enabled"] !== "false";
     const checked = attrs["checkable"] === "true" ? attrs["checked"] === "true" : undefined;
 
     // Keep only nodes that convey content, have an ID, or can be interacted with.
-    if (!text && !contentDesc && !resourceId && !clickable && !scrollable) {
+    if (!text && !contentDesc && !resourceId && !clickable && !scrollable && !focusable) {
       continue;
     }
 

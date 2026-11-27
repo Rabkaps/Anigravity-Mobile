@@ -24,9 +24,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -57,7 +61,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val chatViewModel: ChatViewModel = viewModel()
-            val state by chatViewModel.uiState.collectAsState()
+            val state by chatViewModel.uiState.collectAsStateWithLifecycle()
             val themeMode = AppThemeMode.fromKey(state.preferences?.themeMode)
             val coroutineScope = rememberCoroutineScope()
             var solarLocation by remember { mutableStateOf<Pair<Double, Double>?>(null) }
@@ -197,11 +201,18 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(Unit) {
-                requestAllFilesAccessIfNeeded()
+                if (!hasPromptedAllFilesAccess) {
+                    hasPromptedAllFilesAccess = true
+                    requestAllFilesAccessIfNeeded()
+                }
             }
 
             LaunchedEffect(chatViewModel) {
-                chatViewModel.onRequestVoiceInput = { launchVoiceDictation() }
+                chatViewModel.uiEffects.collect { effect ->
+                    if (effect is ChatViewModel.UiEffect.LaunchVoiceInput) {
+                        launchVoiceDictation()
+                    }
+                }
             }
 
             LaunchedEffect(themeMode) {
@@ -268,10 +279,22 @@ class MainActivity : ComponentActivity() {
                 val isImage = forceImage || detectedMime.startsWith("image/")
 
                 val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
-                val stagedFile = File(stagingRoot, "${System.currentTimeMillis()}_$safeName")
+                val stagedFile = File(stagingRoot, "${java.util.UUID.randomUUID()}_$safeName")
+                val maxCopyBytes = 20L * 1024L * 1024L
+                var copied = 0L
                 contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(stagedFile).use { output ->
-                        input.copyTo(output)
+                        val buf = ByteArray(16 * 1024)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            copied += n
+                            if (copied > maxCopyBytes) {
+                                stagedFile.delete()
+                                return@mapNotNull null
+                            }
+                            output.write(buf, 0, n)
+                        }
                     }
                 } ?: return@mapNotNull null
 
@@ -363,26 +386,31 @@ class MainActivity : ComponentActivity() {
         } else {
             rawBmp
         }
-        val usePng = originalMime.equals("image/png", ignoreCase = true)
-        val outMime = if (usePng) "image/png" else "image/jpeg"
-        val format = if (usePng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
-        val bytes = ByteArrayOutputStream().use { baos ->
-            bmp.compress(format, 85, baos)
-            baos.toByteArray()
+        return try {
+            val usePng = originalMime.equals("image/png", ignoreCase = true)
+            val outMime = if (usePng) "image/png" else "image/jpeg"
+            val format = if (usePng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val bytes = ByteArrayOutputStream().use { baos ->
+                bmp.compress(format, 85, baos)
+                baos.toByteArray()
+            }
+            Base64.encodeToString(bytes, Base64.NO_WRAP) to outMime
+        } finally {
+            bmp.recycle()
         }
-        bmp.recycle()
-        return Base64.encodeToString(bytes, Base64.NO_WRAP) to outMime
     }
 
     private fun resolveTreeUriToPath(uri: Uri): String? {
+        if (uri.authority != "com.android.externalstorage.documents") return null
         val docId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull() ?: return null
         if (docId.startsWith("raw:")) {
-            return docId.removePrefix("raw:")
+            val candidate = docId.removePrefix("raw:")
+            return candidate.takeIf { File(it).isDirectory }
         }
         val split = docId.split(":", limit = 2)
         val type = split.getOrNull(0).orEmpty()
         val rel = split.getOrNull(1).orEmpty()
-        return when {
+        val candidate = when {
             type.equals("primary", ignoreCase = true) -> {
                 val base = Environment.getExternalStorageDirectory().absolutePath
                 if (rel.isBlank()) base else "$base/$rel"
@@ -396,5 +424,11 @@ class MainActivity : ComponentActivity() {
             }
             else -> null
         }
+        return candidate?.takeIf { File(it).isDirectory }
+    }
+
+    companion object {
+        @Volatile
+        private var hasPromptedAllFilesAccess = false
     }
 }

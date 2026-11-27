@@ -99,8 +99,8 @@ server.tool("android_ui_tree", "Dump and parse the current Android UI hierarchy 
     if (blocked) {
         return { content: [{ type: "text", text: blocked }], isError: true };
     }
-    const dumpPath = "/data/local/tmp/agy_ui_dump.xml";
-    const res = await backend.execPrivileged(`uiautomator dump ${dumpPath} >/dev/null 2>&1 && cat ${dumpPath} && rm -f ${dumpPath}`);
+    const dumpPath = `/data/local/tmp/agy_ui_dump_${process.pid}_${Date.now()}.xml`;
+    const res = await backend.execPrivileged(`uiautomator dump ${dumpPath} >/dev/null 2>&1 && cat ${dumpPath}; rm -f ${dumpPath}`);
     if (res.exitCode !== 0 || !res.stdout.includes("<hierarchy")) {
         return {
             content: [
@@ -185,8 +185,8 @@ server.tool("android_launch_app", "Launch an Android application by package name
     if (blocked)
         return { content: [{ type: "text", text: blocked }], isError: true };
     const cmd = activity
-        ? `am start -n ${packageName}/${activity}`
-        : `monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`;
+        ? `am start -n ${shellQuote(`${packageName}/${activity}`)}`
+        : `monkey -p ${shellQuote(packageName)} -c android.intent.category.LAUNCHER 1`;
     const res = await backend.execPrivileged(cmd);
     return {
         content: [{ type: "text", text: formatExecOutput(res.stdout, res.stderr, res.exitCode) }],

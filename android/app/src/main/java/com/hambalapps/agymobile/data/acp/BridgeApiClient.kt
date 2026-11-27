@@ -1,6 +1,7 @@
 package com.hambalapps.agymobile.data.acp
 
 import com.hambalapps.agymobile.data.local.ConnectionProfile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -107,17 +108,23 @@ class BridgeApiClient(
         path: String,
         parse: (String) -> T
     ): Result<T> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val req = Request.Builder()
                 .url("${profile.httpBaseUrl()}$path")
                 .applyAuth(profile)
                 .get()
                 .build()
-            httpClient.newCall(req).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) error("HTTP ${resp.code}: $raw")
-                parse(raw)
-            }
+            Result.success(
+                httpClient.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) error("HTTP ${resp.code}: $raw")
+                    parse(raw)
+                }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 

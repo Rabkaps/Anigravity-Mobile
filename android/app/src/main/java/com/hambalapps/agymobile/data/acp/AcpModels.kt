@@ -9,9 +9,6 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 class AcpRpcException(val code: Int, override val message: String) : IllegalStateException(message)
@@ -197,12 +194,13 @@ data class QuotaSummaryResponse(
 )
 
 sealed interface AcpSessionEvent {
-    data class UserMessageChunk(val sessionId: String, val text: String) : AcpSessionEvent
-    data class AgentMessageChunk(val sessionId: String, val text: String) : AcpSessionEvent
-    data class AgentThoughtChunk(val sessionId: String, val text: String) : AcpSessionEvent
-    data class SubagentUpdate(val sessionId: String, val subagents: List<AcpSubagentInfo>) : AcpSessionEvent
+    val sessionId: String
+    data class UserMessageChunk(override val sessionId: String, val text: String) : AcpSessionEvent
+    data class AgentMessageChunk(override val sessionId: String, val text: String) : AcpSessionEvent
+    data class AgentThoughtChunk(override val sessionId: String, val text: String) : AcpSessionEvent
+    data class SubagentUpdate(override val sessionId: String, val subagents: List<AcpSubagentInfo>) : AcpSessionEvent
     data class ToolCallEvent(
-        val sessionId: String,
+        override val sessionId: String,
         val toolCallId: String,
         val title: String,
         val kind: String,
@@ -213,18 +211,18 @@ sealed interface AcpSessionEvent {
         val diffNew: String? = null,
         val imageBase64: String? = null
     ) : AcpSessionEvent
-    data class PlanUpdate(val sessionId: String, val entries: List<String>) : AcpSessionEvent
-    data class ModeUpdate(val sessionId: String, val modeId: String) : AcpSessionEvent
+    data class PlanUpdate(override val sessionId: String, val entries: List<String>) : AcpSessionEvent
+    data class ModeUpdate(override val sessionId: String, val modeId: String) : AcpSessionEvent
     data class ConfigOptionsUpdate(
-        val sessionId: String,
+        override val sessionId: String,
         val configOptions: List<AcpConfigOption>
     ) : AcpSessionEvent
     data class AvailableCommandsUpdate(
-        val sessionId: String,
+        override val sessionId: String,
         val commands: List<AvailableCommand>
     ) : AcpSessionEvent
     data class UsageUpdate(
-        val sessionId: String,
+        override val sessionId: String,
         val usedTokens: Int,
         val maxTokens: Int
     ) : AcpSessionEvent
@@ -232,35 +230,39 @@ sealed interface AcpSessionEvent {
 
 object AcpParser {
 
-    fun parseInitializeResult(result: JsonElement): AcpInitializeResult {
-        val obj = runCatching { result.jsonObject }.getOrNull() ?: return AcpInitializeResult()
-        val protocolVersion = obj["protocolVersion"]?.jsonPrimitive?.intOrNull ?: 1
-        val agentInfo = obj["agentInfo"]?.jsonObject
-        val agentName = agentInfo?.get("title")?.jsonPrimitive?.contentOrNull
-            ?: agentInfo?.get("name")?.jsonPrimitive?.contentOrNull
-            ?: "Antigravity ACP Server"
-        val agentVersion = agentInfo?.get("version")?.jsonPrimitive?.contentOrNull ?: ""
+    private fun JsonElement?.asObjectOrNull(): JsonObject? = this as? JsonObject
+    private fun JsonElement?.asArrayOrNull(): JsonArray? = this as? JsonArray
+    private fun JsonElement?.asPrimitiveOrNull(): JsonPrimitive? = this as? JsonPrimitive
 
-        val caps = obj["agentCapabilities"]?.jsonObject
-        val loadSession = caps?.get("loadSession")?.jsonPrimitive?.booleanOrNull ?: false
-        val sessionCaps = caps?.get("sessionCapabilities")?.jsonObject
+    fun parseInitializeResult(result: JsonElement): AcpInitializeResult {
+        val obj = result.asObjectOrNull() ?: return AcpInitializeResult()
+        val protocolVersion = obj["protocolVersion"]?.asPrimitiveOrNull()?.intOrNull ?: 1
+        val agentInfo = obj["agentInfo"]?.asObjectOrNull()
+        val agentName = agentInfo?.get("title")?.asPrimitiveOrNull()?.contentOrNull
+            ?: agentInfo?.get("name")?.asPrimitiveOrNull()?.contentOrNull
+            ?: "Antigravity ACP Server"
+        val agentVersion = agentInfo?.get("version")?.asPrimitiveOrNull()?.contentOrNull ?: ""
+
+        val caps = obj["agentCapabilities"]?.asObjectOrNull()
+        val loadSession = caps?.get("loadSession")?.asPrimitiveOrNull()?.booleanOrNull ?: false
+        val sessionCaps = caps?.get("sessionCapabilities")?.asObjectOrNull()
         val supportsList = sessionCaps?.get("list") != null
         val supportsResume = sessionCaps?.get("resume") != null
-        val supportsLogout = caps?.get("auth")?.jsonObject?.get("logout") != null
+        val supportsLogout = caps?.get("auth")?.asObjectOrNull()?.get("logout") != null
 
-        val authMethods = runCatching { obj["authMethods"]?.jsonArray }.getOrNull()
+        val authMethods = obj["authMethods"]?.asArrayOrNull()
             ?.mapNotNull { elem ->
-                val m = elem.jsonObject
-                val id = m["id"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-                val name = m["name"]?.jsonPrimitive?.contentOrNull ?: id
-                val desc = m["description"]?.jsonPrimitive?.contentOrNull ?: ""
-                val type = m["type"]?.jsonPrimitive?.contentOrNull ?: "agent"
-                val args = runCatching {
-                    m["args"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
-                }.getOrNull().orEmpty()
-                val env = runCatching {
-                    m["env"]?.jsonObject?.mapValues { it.value.jsonPrimitive.contentOrNull.orEmpty() }
-                }.getOrNull().orEmpty()
+                val m = elem.asObjectOrNull() ?: return@mapNotNull null
+                val id = m["id"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+                val name = m["name"]?.asPrimitiveOrNull()?.contentOrNull ?: id
+                val desc = m["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+                val type = m["type"]?.asPrimitiveOrNull()?.contentOrNull ?: "agent"
+                val args = m["args"]?.asArrayOrNull()
+                    ?.mapNotNull { it.asPrimitiveOrNull()?.contentOrNull }
+                    .orEmpty()
+                val env = m["env"]?.asObjectOrNull()
+                    ?.mapValues { it.value.asPrimitiveOrNull()?.contentOrNull.orEmpty() }
+                    .orEmpty()
                 AcpAuthMethod(
                     id = id,
                     name = name,
@@ -284,23 +286,23 @@ object AcpParser {
     }
 
     fun parseSessionSetupResult(result: JsonElement): AcpSessionSetupResult {
-        val obj = runCatching { result.jsonObject }.getOrNull()
+        val obj = result.asObjectOrNull()
             ?: return AcpSessionSetupResult("", emptyList())
-        val sessionId = obj["sessionId"]?.jsonPrimitive?.contentOrNull ?: ""
+        val sessionId = obj["sessionId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
 
         val parsedOptions = parseConfigOptionsArray(obj["configOptions"]).toMutableList()
 
         // Backwards compatibility: synthesize mode/model options if server omitted configOptions
         val hasMode = parsedOptions.any { it.category == "mode" || it.id == "mode" }
         if (!hasMode) {
-            obj["modes"]?.jsonObject?.let { modesObj ->
-                val current = modesObj["currentModeId"]?.jsonPrimitive?.contentOrNull ?: ""
-                val available = runCatching { modesObj["availableModes"]?.jsonArray }.getOrNull()
+            obj["modes"]?.asObjectOrNull()?.let { modesObj ->
+                val current = modesObj["currentModeId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+                val available = modesObj["availableModes"]?.asArrayOrNull()
                     ?.mapNotNull { elem ->
-                        val m = elem.jsonObject
-                        val id = m["id"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-                        val name = m["name"]?.jsonPrimitive?.contentOrNull ?: id
-                        val desc = m["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val m = elem.asObjectOrNull() ?: return@mapNotNull null
+                        val id = m["id"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+                        val name = m["name"]?.asPrimitiveOrNull()?.contentOrNull ?: id
+                        val desc = m["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
                         AcpConfigChoice(value = id, name = name, description = desc)
                     }.orEmpty()
                 if (available.isNotEmpty()) {
@@ -320,16 +322,16 @@ object AcpParser {
 
         val hasModel = parsedOptions.any { it.category == "model" || it.id == "model" }
         if (!hasModel) {
-            obj["models"]?.jsonObject?.let { modelsObj ->
-                val current = modelsObj["currentModelId"]?.jsonPrimitive?.contentOrNull ?: ""
-                val available = runCatching { modelsObj["availableModels"]?.jsonArray }.getOrNull()
+            obj["models"]?.asObjectOrNull()?.let { modelsObj ->
+                val current = modelsObj["currentModelId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+                val available = modelsObj["availableModels"]?.asArrayOrNull()
                     ?.mapNotNull { elem ->
-                        val m = elem.jsonObject
-                        val id = m["modelId"]?.jsonPrimitive?.contentOrNull
-                            ?: m["id"]?.jsonPrimitive?.contentOrNull
+                        val m = elem.asObjectOrNull() ?: return@mapNotNull null
+                        val id = m["modelId"]?.asPrimitiveOrNull()?.contentOrNull
+                            ?: m["id"]?.asPrimitiveOrNull()?.contentOrNull
                             ?: return@mapNotNull null
-                        val name = m["name"]?.jsonPrimitive?.contentOrNull ?: id
-                        val desc = m["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val name = m["name"]?.asPrimitiveOrNull()?.contentOrNull ?: id
+                        val desc = m["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
                         AcpConfigChoice(value = id, name = name, description = desc)
                     }.orEmpty()
                 if (available.isNotEmpty()) {
@@ -351,15 +353,15 @@ object AcpParser {
     }
 
     fun parseConfigOptionsArray(elem: JsonElement?): List<AcpConfigOption> {
-        val arr = runCatching { elem?.jsonArray }.getOrNull() ?: return emptyList()
+        val arr = elem.asArrayOrNull() ?: return emptyList()
         return arr.mapNotNull { item ->
-            val obj = runCatching { item.jsonObject }.getOrNull() ?: return@mapNotNull null
-            val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: id
-            val description = obj["description"]?.jsonPrimitive?.contentOrNull ?: ""
-            val category = obj["category"]?.jsonPrimitive?.contentOrNull ?: ""
-            val type = obj["type"]?.jsonPrimitive?.contentOrNull ?: "select"
-            val currentValue = obj["currentValue"]?.jsonPrimitive?.contentOrNull ?: ""
+            val obj = item.asObjectOrNull() ?: return@mapNotNull null
+            val id = obj["id"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+            val name = obj["name"]?.asPrimitiveOrNull()?.contentOrNull ?: id
+            val description = obj["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+            val category = obj["category"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+            val type = obj["type"]?.asPrimitiveOrNull()?.contentOrNull ?: "select"
+            val currentValue = obj["currentValue"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
             val choices = parseConfigChoices(obj["options"])
 
             AcpConfigOption(
@@ -375,25 +377,25 @@ object AcpParser {
     }
 
     private fun parseConfigChoices(elem: JsonElement?): List<AcpConfigChoice> {
-        val arr = runCatching { elem?.jsonArray }.getOrNull() ?: return emptyList()
+        val arr = elem.asArrayOrNull() ?: return emptyList()
         val choices = mutableListOf<AcpConfigChoice>()
         for (entry in arr) {
-            val obj = runCatching { entry.jsonObject }.getOrNull() ?: continue
-            val groupOptions = runCatching { obj["options"]?.jsonArray }.getOrNull()
+            val obj = entry.asObjectOrNull() ?: continue
+            val groupOptions = obj["options"]?.asArrayOrNull()
             if (groupOptions != null) {
-                val groupName = obj["name"]?.jsonPrimitive?.contentOrNull
-                    ?: obj["group"]?.jsonPrimitive?.contentOrNull
+                val groupName = obj["name"]?.asPrimitiveOrNull()?.contentOrNull
+                    ?: obj["group"]?.asPrimitiveOrNull()?.contentOrNull
                 for (sub in groupOptions) {
-                    val subObj = runCatching { sub.jsonObject }.getOrNull() ?: continue
-                    val value = subObj["value"]?.jsonPrimitive?.contentOrNull ?: continue
-                    val name = subObj["name"]?.jsonPrimitive?.contentOrNull ?: value
-                    val desc = subObj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val subObj = sub.asObjectOrNull() ?: continue
+                    val value = subObj["value"]?.asPrimitiveOrNull()?.contentOrNull ?: continue
+                    val name = subObj["name"]?.asPrimitiveOrNull()?.contentOrNull ?: value
+                    val desc = subObj["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
                     choices.add(AcpConfigChoice(value = value, name = name, description = desc, group = groupName))
                 }
             } else {
-                val value = obj["value"]?.jsonPrimitive?.contentOrNull ?: continue
-                val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: value
-                val desc = obj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                val value = obj["value"]?.asPrimitiveOrNull()?.contentOrNull ?: continue
+                val name = obj["name"]?.asPrimitiveOrNull()?.contentOrNull ?: value
+                val desc = obj["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
                 choices.add(AcpConfigChoice(value = value, name = name, description = desc))
             }
         }
@@ -401,39 +403,40 @@ object AcpParser {
     }
 
     fun parseSessionList(result: JsonElement): List<SessionSummary> {
-        val obj = runCatching { result.jsonObject }.getOrNull() ?: return emptyList()
-        val arr = runCatching { obj["sessions"]?.jsonArray }.getOrNull() ?: return emptyList()
+        val obj = result.asObjectOrNull() ?: return emptyList()
+        val arr = obj["sessions"]?.asArrayOrNull() ?: return emptyList()
         return arr.mapNotNull { elem ->
-            val s = elem.jsonObject
-            val id = s["sessionId"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val title = s["title"]?.jsonPrimitive?.contentOrNull?.ifBlank { id } ?: id
-            val cwd = s["cwd"]?.jsonPrimitive?.contentOrNull ?: ""
-            val updatedAt = s["updatedAt"]?.jsonPrimitive?.contentOrNull ?: ""
+            val s = elem.asObjectOrNull() ?: return@mapNotNull null
+            val id = s["sessionId"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+            val title = s["title"]?.asPrimitiveOrNull()?.contentOrNull?.ifBlank { id } ?: id
+            val cwd = s["cwd"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+            val updatedAt = s["updatedAt"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
             SessionSummary(id = id, title = title, cwd = cwd, updatedAt = updatedAt)
         }
     }
 
     fun parseElicitationRequest(rpcId: JsonElement, params: JsonObject): AcpElicitationRequest {
-        val sessionId = params["sessionId"]?.jsonPrimitive?.contentOrNull ?: ""
-        val mode = params["mode"]?.jsonPrimitive?.contentOrNull ?: "form"
-        val message = params["message"]?.jsonPrimitive?.contentOrNull ?: "Agent requested input"
-        val url = params["url"]?.jsonPrimitive?.contentOrNull
+        val sessionId = params["sessionId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+        val mode = params["mode"]?.asPrimitiveOrNull()?.contentOrNull ?: "form"
+        val message = params["message"]?.asPrimitiveOrNull()?.contentOrNull ?: "Agent requested input"
+        val url = params["url"]?.asPrimitiveOrNull()?.contentOrNull
 
-        val schemaObj = runCatching { params["requestedSchema"]?.jsonObject }.getOrNull()
-        val requiredKeys = runCatching {
-            schemaObj?.get("required")?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }?.toSet()
-        }.getOrNull().orEmpty()
-        val properties = runCatching { schemaObj?.get("properties")?.jsonObject }.getOrNull()
+        val schemaObj = params["requestedSchema"]?.asObjectOrNull()
+        val requiredKeys = schemaObj?.get("required")?.asArrayOrNull()
+            ?.mapNotNull { it.asPrimitiveOrNull()?.contentOrNull }
+            ?.toSet()
+            .orEmpty()
+        val properties = schemaObj?.get("properties")?.asObjectOrNull()
 
-        val fields = properties?.entries?.map { (key, rawDef) ->
-            val def = rawDef.jsonObject
-            val title = def["title"]?.jsonPrimitive?.contentOrNull ?: key
-            val desc = def["description"]?.jsonPrimitive?.contentOrNull ?: ""
-            val type = def["type"]?.jsonPrimitive?.contentOrNull ?: "string"
-            val enumOpts = runCatching {
-                def["enum"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
-            }.getOrNull().orEmpty()
-            val defVal = def["default"]?.jsonPrimitive?.contentOrNull ?: ""
+        val fields = properties?.entries?.mapNotNull { (key, rawDef) ->
+            val def = rawDef.asObjectOrNull() ?: return@mapNotNull null
+            val title = def["title"]?.asPrimitiveOrNull()?.contentOrNull ?: key
+            val desc = def["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+            val type = def["type"]?.asPrimitiveOrNull()?.contentOrNull ?: "string"
+            val enumOpts = def["enum"]?.asArrayOrNull()
+                ?.mapNotNull { it.asPrimitiveOrNull()?.contentOrNull }
+                .orEmpty()
+            val defVal = def["default"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
             AcpElicitationField(
                 key = key,
                 title = title,
@@ -473,9 +476,9 @@ object AcpParser {
     }
 
     fun parseSessionUpdate(params: JsonObject): AcpSessionEvent? {
-        val sessionId = params["sessionId"]?.jsonPrimitive?.contentOrNull ?: ""
-        val update = params["update"]?.jsonObject ?: return null
-        val kind = update["sessionUpdate"]?.jsonPrimitive?.contentOrNull ?: return null
+        val sessionId = params["sessionId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+        val update = params["update"]?.asObjectOrNull() ?: return null
+        val kind = update["sessionUpdate"]?.asPrimitiveOrNull()?.contentOrNull ?: return null
 
         return when (kind) {
             "user_message_chunk" -> {
@@ -493,7 +496,7 @@ object AcpParser {
             "subagent_update", "subagents_update" -> parseSubagentUpdate(sessionId, update)
             "tool_call", "tool_call_update" -> parseToolCall(sessionId, update)
             "current_mode_update" -> {
-                val modeId = update["currentModeId"]?.jsonPrimitive?.contentOrNull ?: return null
+                val modeId = update["currentModeId"]?.asPrimitiveOrNull()?.contentOrNull ?: return null
                 AcpSessionEvent.ModeUpdate(sessionId, modeId)
             }
             "config_option_update" -> {
@@ -501,31 +504,31 @@ object AcpParser {
                 AcpSessionEvent.ConfigOptionsUpdate(sessionId, opts)
             }
             "available_commands_update" -> {
-                val arr = update["availableCommands"]?.jsonArray ?: return null
+                val arr = update["availableCommands"]?.asArrayOrNull() ?: return null
                 val cmds = arr.mapNotNull { elem ->
-                    val obj = elem.jsonObject
-                    val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-                    val desc = obj["description"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val obj = elem.asObjectOrNull() ?: return@mapNotNull null
+                    val name = obj["name"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+                    val desc = obj["description"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
                     AvailableCommand(name = name, description = desc)
                 }
                 AcpSessionEvent.AvailableCommandsUpdate(sessionId, cmds)
             }
             "plan" -> {
-                val arr = update["entries"]?.jsonArray ?: return null
+                val arr = update["entries"]?.asArrayOrNull() ?: return null
                 val items = arr.mapNotNull { entry ->
-                    val obj = entry.jsonObject
-                    val content = obj["content"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-                    val status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "pending"
+                    val obj = entry.asObjectOrNull() ?: return@mapNotNull null
+                    val content = obj["content"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+                    val status = obj["status"]?.asPrimitiveOrNull()?.contentOrNull ?: "pending"
                     "[$status] $content"
                 }
                 AcpSessionEvent.PlanUpdate(sessionId, items)
             }
             "usage_update" -> {
-                val used = update["used"]?.jsonPrimitive?.intOrNull
-                    ?: update["usedTokens"]?.jsonPrimitive?.intOrNull
+                val used = update["used"]?.asPrimitiveOrNull()?.intOrNull
+                    ?: update["usedTokens"]?.asPrimitiveOrNull()?.intOrNull
                     ?: 0
-                val max = update["size"]?.jsonPrimitive?.intOrNull
-                    ?: update["maxTokens"]?.jsonPrimitive?.intOrNull
+                val max = update["size"]?.asPrimitiveOrNull()?.intOrNull
+                    ?: update["maxTokens"]?.asPrimitiveOrNull()?.intOrNull
                     ?: 1
                 AcpSessionEvent.UsageUpdate(sessionId, used, max)
             }
@@ -534,18 +537,18 @@ object AcpParser {
     }
 
     fun parsePermissionRequest(rpcId: JsonElement, params: JsonObject): AcpPermissionRequest {
-        val sessionId = params["sessionId"]?.jsonPrimitive?.contentOrNull ?: ""
-        val toolCall = params["toolCall"]?.jsonObject
-        val toolCallId = toolCall?.get("toolCallId")?.jsonPrimitive?.contentOrNull ?: ""
-        val title = toolCall?.get("title")?.jsonPrimitive?.contentOrNull ?: "Tool permission requested"
-        val kind = toolCall?.get("kind")?.jsonPrimitive?.contentOrNull ?: "other"
+        val sessionId = params["sessionId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+        val toolCall = params["toolCall"]?.asObjectOrNull()
+        val toolCallId = toolCall?.get("toolCallId")?.asPrimitiveOrNull()?.contentOrNull ?: ""
+        val title = toolCall?.get("title")?.asPrimitiveOrNull()?.contentOrNull ?: "Tool permission requested"
+        val kind = toolCall?.get("kind")?.asPrimitiveOrNull()?.contentOrNull ?: "other"
         val rawInput = toolCall?.get("rawInput")?.toString() ?: ""
 
-        val options = params["options"]?.jsonArray?.mapNotNull { item ->
-            val obj = item.jsonObject
-            val id = obj["optionId"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: id
-            val optKind = obj["kind"]?.jsonPrimitive?.contentOrNull ?: "allow_once"
+        val options = params["options"]?.asArrayOrNull()?.mapNotNull { item ->
+            val obj = item.asObjectOrNull() ?: return@mapNotNull null
+            val id = obj["optionId"]?.asPrimitiveOrNull()?.contentOrNull ?: return@mapNotNull null
+            val name = obj["name"]?.asPrimitiveOrNull()?.contentOrNull ?: id
+            val optKind = obj["kind"]?.asPrimitiveOrNull()?.contentOrNull ?: "allow_once"
             AcpPermissionOption(optionId = id, name = name, kind = optKind)
         } ?: listOf(
             AcpPermissionOption("allow_once", "Allow Once", "allow_once"),
@@ -568,44 +571,42 @@ object AcpParser {
         if (contentElem == null) return null
         return when (contentElem) {
             is JsonPrimitive -> contentElem.contentOrNull
-            is JsonObject -> contentElem["text"]?.jsonPrimitive?.contentOrNull
-            else -> contentElem.jsonArray.joinToString("") { item ->
-                item.jsonObject["text"]?.jsonPrimitive?.contentOrNull ?: ""
+            is JsonObject -> contentElem["text"]?.asPrimitiveOrNull()?.contentOrNull
+            is JsonArray -> contentElem.joinToString("") { item ->
+                item.asObjectOrNull()?.get("text")?.asPrimitiveOrNull()?.contentOrNull ?: ""
             }
         }
     }
 
     private fun parseSubagentEntry(obj: JsonObject): AcpSubagentInfo? {
-        val id = obj["subagentId"]?.jsonPrimitive?.contentOrNull
-            ?: obj["sessionId"]?.jsonPrimitive?.contentOrNull
-            ?: obj["id"]?.jsonPrimitive?.contentOrNull
+        val id = obj["subagentId"]?.asPrimitiveOrNull()?.contentOrNull
+            ?: obj["sessionId"]?.asPrimitiveOrNull()?.contentOrNull
+            ?: obj["id"]?.asPrimitiveOrNull()?.contentOrNull
             ?: return null
-        val name = obj["title"]?.jsonPrimitive?.contentOrNull
-            ?: obj["name"]?.jsonPrimitive?.contentOrNull
+        val name = obj["title"]?.asPrimitiveOrNull()?.contentOrNull
+            ?: obj["name"]?.asPrimitiveOrNull()?.contentOrNull
             ?: ""
-        val role = obj["description"]?.jsonPrimitive?.contentOrNull
-            ?: obj["role"]?.jsonPrimitive?.contentOrNull
+        val role = obj["description"]?.asPrimitiveOrNull()?.contentOrNull
+            ?: obj["role"]?.asPrimitiveOrNull()?.contentOrNull
             ?: ""
-        val status = runCatching {
-            obj["state"]?.jsonObject?.get("state")?.jsonPrimitive?.contentOrNull
-        }.getOrNull()
-            ?: obj["status"]?.jsonPrimitive?.contentOrNull
+        val status = obj["state"]?.asObjectOrNull()?.get("state")?.asPrimitiveOrNull()?.contentOrNull
+            ?: obj["status"]?.asPrimitiveOrNull()?.contentOrNull
             ?: "active"
         return AcpSubagentInfo(id = id, name = name, role = role, status = status)
     }
 
     private fun parseSubagentUpdate(sessionId: String, update: JsonObject): AcpSessionEvent.SubagentUpdate? {
-        val list = runCatching { update["subagents"]?.jsonArray }.getOrNull()
-            ?.mapNotNull { runCatching { parseSubagentEntry(it.jsonObject) }.getOrNull() }
+        val list = update["subagents"]?.asArrayOrNull()
+            ?.mapNotNull { it.asObjectOrNull()?.let(::parseSubagentEntry) }
             ?: listOfNotNull(parseSubagentEntry(update))
         return if (list.isEmpty()) null else AcpSessionEvent.SubagentUpdate(sessionId, list)
     }
 
     private fun parseToolCall(sessionId: String, update: JsonObject): AcpSessionEvent.ToolCallEvent {
-        val toolCallId = update["toolCallId"]?.jsonPrimitive?.contentOrNull ?: ""
-        val title = update["title"]?.jsonPrimitive?.contentOrNull ?: "Tool"
-        val kind = update["kind"]?.jsonPrimitive?.contentOrNull ?: "other"
-        val status = update["status"]?.jsonPrimitive?.contentOrNull ?: "in_progress"
+        val toolCallId = update["toolCallId"]?.asPrimitiveOrNull()?.contentOrNull ?: ""
+        val title = update["title"]?.asPrimitiveOrNull()?.contentOrNull ?: "Tool"
+        val kind = update["kind"]?.asPrimitiveOrNull()?.contentOrNull ?: "other"
+        val status = update["status"]?.asPrimitiveOrNull()?.contentOrNull ?: "in_progress"
 
         val textParts = mutableListOf<String>()
         var diffPath: String? = null
@@ -613,29 +614,29 @@ object AcpParser {
         var diffNew: String? = null
         var imageBase64: String? = null
 
-        val contentArr = runCatching { update["content"]?.jsonArray }.getOrNull()
+        val contentArr = update["content"]?.asArrayOrNull()
         contentArr?.forEach { blockElem ->
-            val block = blockElem.jsonObject
-            when (block["type"]?.jsonPrimitive?.contentOrNull) {
+            val block = blockElem.asObjectOrNull() ?: return@forEach
+            when (block["type"]?.asPrimitiveOrNull()?.contentOrNull) {
                 "content" -> {
-                    val inner = block["content"]?.jsonObject
-                    val innerType = inner?.get("type")?.jsonPrimitive?.contentOrNull
+                    val inner = block["content"]?.asObjectOrNull()
+                    val innerType = inner?.get("type")?.asPrimitiveOrNull()?.contentOrNull
                     if (innerType == "text") {
-                        inner["text"]?.jsonPrimitive?.contentOrNull?.let(textParts::add)
+                        inner["text"]?.asPrimitiveOrNull()?.contentOrNull?.let(textParts::add)
                     } else if (innerType == "image") {
-                        imageBase64 = inner["data"]?.jsonPrimitive?.contentOrNull
+                        imageBase64 = inner["data"]?.asPrimitiveOrNull()?.contentOrNull
                     }
                 }
                 "text" -> {
-                    block["text"]?.jsonPrimitive?.contentOrNull?.let(textParts::add)
+                    block["text"]?.asPrimitiveOrNull()?.contentOrNull?.let(textParts::add)
                 }
                 "image" -> {
-                    imageBase64 = block["data"]?.jsonPrimitive?.contentOrNull
+                    imageBase64 = block["data"]?.asPrimitiveOrNull()?.contentOrNull
                 }
                 "diff" -> {
-                    diffPath = block["path"]?.jsonPrimitive?.contentOrNull
-                    diffOld = block["oldText"]?.jsonPrimitive?.contentOrNull
-                    diffNew = block["newText"]?.jsonPrimitive?.contentOrNull
+                    diffPath = block["path"]?.asPrimitiveOrNull()?.contentOrNull
+                    diffOld = block["oldText"]?.asPrimitiveOrNull()?.contentOrNull
+                    diffNew = block["newText"]?.asPrimitiveOrNull()?.contentOrNull
                 }
             }
         }

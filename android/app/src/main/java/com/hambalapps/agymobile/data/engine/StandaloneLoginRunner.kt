@@ -14,8 +14,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.BufferedWriter
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.URLDecoder
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class GoogleLoginPhase {
     IDLE,
@@ -51,15 +53,21 @@ class StandaloneLoginRunner(
     private var proc: Process? = null
     @Volatile
     private var stdinWriter: BufferedWriter? = null
+    private val writerLock = Any()
     private var loginJob: Job? = null
     private var tokenWatchJob: Job? = null
+    private var submitJob: Job? = null
+    private var sessionStartMs: Long = 0L
+    private val succeeded = AtomicBoolean(false)
     @Volatile
     private var autoOpenedUrl: String? = null
 
     fun startLogin(onAuthenticated: () -> Unit) {
         cancelInternal(resetState = false)
+        succeeded.set(false)
         autoOpenedUrl = null
         val startTimeMs = System.currentTimeMillis()
+        sessionStartMs = startTimeMs
         _state.value = GoogleLoginState(
             phase = GoogleLoginPhase.STARTING,
             logOutput = "Starting agy Google sign-in…\n"
@@ -91,19 +99,22 @@ class StandaloneLoginRunner(
 
                 val started = pb.start()
                 proc = started
-                stdinWriter = BufferedWriter(OutputStreamWriter(started.outputStream, Charsets.UTF_8))
+                synchronized(writerLock) {
+                    stdinWriter = BufferedWriter(OutputStreamWriter(started.outputStream, Charsets.UTF_8))
+                }
 
-                val buf = ByteArray(2048)
-                val inp = started.inputStream
-                while (isActive) {
-                    val n = runCatching { inp.read(buf) }.getOrDefault(-1)
-                    if (n <= 0) break
-                    val chunk = ANSI_REGEX.replace(String(buf, 0, n, Charsets.UTF_8), "")
-                    appendLogAndDetectUrl(chunk)
+                val buf = CharArray(2048)
+                InputStreamReader(started.inputStream, Charsets.UTF_8).use { reader ->
+                    while (isActive) {
+                        val n = runCatching { reader.read(buf) }.getOrDefault(-1)
+                        if (n <= 0) break
+                        val chunk = ANSI_REGEX.replace(String(buf, 0, n), "")
+                        appendLogAndDetectUrl(chunk)
+                    }
                 }
 
                 val exitCode = runCatching { started.waitFor() }.getOrDefault(-1)
-                if (_state.value.phase == GoogleLoginPhase.SUCCESS) return@launch
+                if (succeeded.get() || _state.value.phase == GoogleLoginPhase.SUCCESS) return@launch
 
                 val tok = engineManager.oauthTokenFile
                 if (tok.exists() && tok.lastModified() >= startTimeMs - 1_000L && tok.length() > 20L) {
@@ -136,7 +147,7 @@ class StandaloneLoginRunner(
             return
         }
 
-        val writer = stdinWriter
+        val writer = synchronized(writerLock) { stdinWriter }
         if (writer == null) {
             _state.update {
                 it.copy(
@@ -155,11 +166,15 @@ class StandaloneLoginRunner(
             )
         }
 
-        scope.launch {
+        submitJob?.cancel()
+        val capturedStartMs = sessionStartMs
+        submitJob = scope.launch {
             runCatching {
-                writer.write(cleanCode)
-                writer.newLine()
-                writer.flush()
+                synchronized(writerLock) {
+                    writer.write(cleanCode)
+                    writer.newLine()
+                    writer.flush()
+                }
             }.onFailure { err ->
                 _state.update {
                     it.copy(
@@ -172,10 +187,10 @@ class StandaloneLoginRunner(
 
             // Wait up to 25s for token file or process completion
             repeat(50) {
-                if (_state.value.phase == GoogleLoginPhase.SUCCESS) return@launch
+                if (!isActive || succeeded.get() || _state.value.phase == GoogleLoginPhase.SUCCESS) return@launch
                 if (_state.value.phase == GoogleLoginPhase.ERROR) return@launch
                 val tok = engineManager.oauthTokenFile
-                if (tok.exists() && tok.length() > 20L &&
+                if (tok.exists() && tok.lastModified() >= capturedStartMs - 1_000L && tok.length() > 20L &&
                     _state.value.phase == GoogleLoginPhase.SUBMITTING_CODE &&
                     proc?.isAlive == false
                 ) {
@@ -185,7 +200,7 @@ class StandaloneLoginRunner(
                 delay(500L)
             }
 
-            if (_state.value.phase == GoogleLoginPhase.SUBMITTING_CODE) {
+            if (isActive && _state.value.phase == GoogleLoginPhase.SUBMITTING_CODE) {
                 _state.update {
                     it.copy(
                         phase = GoogleLoginPhase.ERROR,
@@ -201,13 +216,17 @@ class StandaloneLoginRunner(
     }
 
     private fun cancelInternal(resetState: Boolean) {
+        submitJob?.cancel()
+        submitJob = null
         tokenWatchJob?.cancel()
         tokenWatchJob = null
         loginJob?.cancel()
         loginJob = null
-        runCatching { stdinWriter?.close() }
-        stdinWriter = null
-        runCatching { proc?.destroy() }
+        synchronized(writerLock) {
+            runCatching { stdinWriter?.close() }
+            stdinWriter = null
+        }
+        runCatching { proc?.destroyForcibly() }
         proc = null
         if (resetState) {
             _state.value = GoogleLoginState()
@@ -215,7 +234,7 @@ class StandaloneLoginRunner(
     }
 
     private fun markSuccess(onAuthenticated: () -> Unit) {
-        if (_state.value.phase == GoogleLoginPhase.SUCCESS) return
+        if (!succeeded.compareAndSet(false, true)) return
         _state.update {
             it.copy(
                 phase = GoogleLoginPhase.SUCCESS,
@@ -223,9 +242,12 @@ class StandaloneLoginRunner(
                 logOutput = (it.logOutput + "\n[Google sign-in complete!]\n").takeLast(8_000)
             )
         }
+        submitJob?.cancel()
         tokenWatchJob?.cancel()
-        runCatching { stdinWriter?.close() }
-        stdinWriter = null
+        synchronized(writerLock) {
+            runCatching { stdinWriter?.close() }
+            stdinWriter = null
+        }
         runCatching { proc?.destroy() }
         proc = null
         onAuthenticated()
@@ -233,37 +255,42 @@ class StandaloneLoginRunner(
 
     private fun appendLogAndDetectUrl(chunk: String) {
         if (chunk.isEmpty()) return
-        val combined = (_state.value.logOutput + chunk).takeLast(8_000)
-        val detected = URL_REGEX.findAll(combined)
-            .map { it.value.trimEnd('.', ',', ';', ':', '!', '?') }
-            .filter { it.startsWith("http://") || it.startsWith("https://") }
-            .lastOrNull { PtyWebSocketClient.isAuthLikeUrl(it) }
-
-        val shouldMoveToAwaiting = detected != null &&
-            (_state.value.phase == GoogleLoginPhase.STARTING || _state.value.phase == GoogleLoginPhase.AWAITING_CODE)
-
-        _state.update {
-            it.copy(
-                phase = if (shouldMoveToAwaiting) GoogleLoginPhase.AWAITING_CODE else it.phase,
-                authUrl = detected ?: it.authUrl,
+        var detectedToOpen: String? = null
+        _state.update { state ->
+            val combined = (state.logOutput + chunk).takeLast(8_000)
+            val detected = URL_TERMINATED_REGEX.findAll(combined)
+                .map { it.groupValues[1].trimEnd('.', ',', ';', ':', '!', '?') }
+                .filter { it.startsWith("http://") || it.startsWith("https://") }
+                .lastOrNull { PtyWebSocketClient.isAuthLikeUrl(it) }
+            if (detected != null && detected != autoOpenedUrl) {
+                autoOpenedUrl = detected
+                detectedToOpen = detected
+            }
+            val shouldMoveToAwaiting = detected != null &&
+                (state.phase == GoogleLoginPhase.STARTING || state.phase == GoogleLoginPhase.AWAITING_CODE)
+            state.copy(
+                phase = if (shouldMoveToAwaiting) GoogleLoginPhase.AWAITING_CODE else state.phase,
+                authUrl = detected ?: state.authUrl,
                 logOutput = combined
             )
         }
 
-        if (detected != null && detected != autoOpenedUrl) {
-            autoOpenedUrl = detected
-            engineManager.openUrlInBrowser(detected, force = false)
+        detectedToOpen?.let { url ->
+            engineManager.openUrlInBrowser(url, force = false)
         }
     }
 
     companion object {
         private val ANSI_REGEX = Regex("\\u001B\\[[0-9;?]*[A-Za-z]")
-        private val URL_REGEX = Regex("https?://[^\\s)\\]\\}>\"']+")
+        private val URL_TERMINATED_REGEX = Regex("(https?://[^\\s)\\]\\}>\"']+)\\s")
 
         fun extractAuthCode(raw: String): String {
             val trimmed = raw.trim()
             if (trimmed.contains("code=")) {
-                val afterCode = trimmed.substringAfter("code=").substringBefore('&').substringBefore('#')
+                val afterCode = trimmed.substringAfter("code=")
+                    .takeWhile { !it.isWhitespace() }
+                    .substringBefore('&')
+                    .substringBefore('#')
                 val decoded = runCatching { URLDecoder.decode(afterCode, "UTF-8") }.getOrDefault(afterCode)
                 if (decoded.isNotBlank()) return decoded.trim()
             }

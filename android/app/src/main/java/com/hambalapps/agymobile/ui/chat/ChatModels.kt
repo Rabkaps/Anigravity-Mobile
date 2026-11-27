@@ -83,6 +83,13 @@ enum class ActiveSheet {
     SETTINGS
 }
 
+data class BtwSideNoteUi(
+    val question: String,
+    val answer: String = "",
+    val isLoading: Boolean = true,
+    val error: String? = null
+)
+
 data class ChatUiState(
     val preferences: AppPreferences? = null,
     val connectionState: BridgeConnectionState = BridgeConnectionState.DISCONNECTED,
@@ -124,6 +131,7 @@ data class ChatUiState(
     val isLoadingQuota: Boolean = false,
     val standaloneInstalled: Boolean = false,
     val standaloneToolchainInstalled: Boolean = false,
+    val standaloneAndroidSdkInstalled: Boolean = false,
     val standaloneSignedIn: Boolean = false,
     val standaloneAgyVersion: String? = null,
     val standaloneProgress: Float? = null,
@@ -137,7 +145,8 @@ data class ChatUiState(
     val pluginStatusMessage: String? = null,
     val globalRulesText: String = "",
     val workspaceRulesText: String = "",
-    val discoveredSkills: List<SkillItemInfo> = emptyList()
+    val discoveredSkills: List<SkillItemInfo> = emptyList(),
+    val btwSideNote: BtwSideNoteUi? = null
 ) {
     val activeProfile: ConnectionProfile?
         get() = preferences?.activeProfile
@@ -175,8 +184,17 @@ data class ChatUiState(
 
     val runningTasks: List<ToolCallUi>
         get() = messages.flatMap { it.toolCalls }.filter {
-            it.status.lowercase() !in setOf("completed", "failed", "error", "cancelled", "done")
+            it.status.lowercase() !in TERMINAL_TASK_STATUSES
         }
+
+    val allToolCalls: List<ToolCallUi>
+        get() = messages.flatMap { it.toolCalls }
+
+    val latestPlanSteps: List<String>
+        get() = messages.lastOrNull { it.planSteps.isNotEmpty() }?.planSteps.orEmpty()
+
+    val activeThinkingText: String
+        get() = messages.lastOrNull { it.role == MessageRole.AGENT && it.thinking.isNotBlank() }?.thinking.orEmpty()
 
     fun quotaForModelChoice(choiceValue: String, choiceName: String = ""): ModelQuotaInfo? {
         val summary = quotaSummary ?: return null
@@ -184,7 +202,7 @@ data class ChatUiState(
         if (models.isEmpty() && summary.buckets.isEmpty()) return null
 
         val lower = choiceValue.lowercase()
-        val stripped = lower.replace(Regex("-(minimal|low|medium|high|xhigh|none|tiered|sonar)$"), "")
+        val stripped = lower.replace(EFFORT_SUFFIX_REGEX, "")
         val direct = models[choiceValue]
             ?: models[lower]
             ?: models[stripped]
@@ -233,5 +251,10 @@ data class ChatUiState(
                 disabled = it.disabled
             )
         }
+    }
+
+    companion object {
+        private val TERMINAL_TASK_STATUSES = setOf("completed", "failed", "error", "cancelled", "done")
+        private val EFFORT_SUFFIX_REGEX = Regex("-(minimal|low|medium|high|xhigh|none|tiered|sonar)$")
     }
 }

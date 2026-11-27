@@ -43,6 +43,7 @@ import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
@@ -71,7 +72,10 @@ import com.hambalapps.agymobile.ui.chat.ActiveSheet
 import com.hambalapps.agymobile.ui.chat.detectTextDirection
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
+import androidx.compose.runtime.produceState
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private enum class FolderPickerTarget {
     WORKSPACE_CWD,
@@ -594,6 +598,12 @@ fun SessionsDrawerContent(
     }
 }
 
+private data class DirectoryListingState(
+    val isLoading: Boolean = true,
+    val subdirs: List<File> = emptyList(),
+    val parentPath: String? = null
+)
+
 @Composable
 private fun DirectoryPickerDialog(
     initialPath: String,
@@ -603,24 +613,38 @@ private fun DirectoryPickerDialog(
     onOpenSystemPicker: () -> Unit
 ) {
     var currentPath by remember(initialPath) {
-        val f = File(initialPath)
         mutableStateOf(
-            when {
-                f.isDirectory -> f.absolutePath
-                f.parentFile?.isDirectory == true -> f.parentFile!!.absolutePath
-                engineHomePath.isNotBlank() && File(engineHomePath).isDirectory -> engineHomePath
-                else -> "/storage/emulated/0"
+            initialPath.ifBlank {
+                engineHomePath.ifBlank { "/storage/emulated/0" }
             }
         )
     }
-    val currentDir = remember(currentPath) { File(currentPath) }
-    val subdirs = remember(currentPath) {
-        currentDir.listFiles()
-            ?.filter { it.isDirectory && it.canRead() }
-            ?.sortedBy { it.name.lowercase() }
-            .orEmpty()
+    val listing by produceState(
+        initialValue = DirectoryListingState(isLoading = true),
+        key1 = currentPath,
+        key2 = engineHomePath
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val f = File(currentPath)
+            val resolved = when {
+                f.isDirectory -> f
+                f.parentFile?.isDirectory == true -> f.parentFile!!
+                engineHomePath.isNotBlank() && File(engineHomePath).isDirectory -> File(engineHomePath)
+                else -> File("/storage/emulated/0")
+            }
+            if (resolved.absolutePath != currentPath) {
+                currentPath = resolved.absolutePath
+            }
+            val dirs = resolved.listFiles()
+                ?.filter { it.isDirectory && it.canRead() }
+                ?.sortedBy { it.name.lowercase() }
+                .orEmpty()
+            val parent = resolved.parentFile?.takeIf { it.canRead() }?.absolutePath
+            DirectoryListingState(isLoading = false, subdirs = dirs, parentPath = parent)
+        }
     }
-    val parentPath = currentDir.parentFile?.takeIf { it.canRead() }?.absolutePath
+    val subdirs = listing.subdirs
+    val parentPath = listing.parentPath
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -693,7 +717,22 @@ private fun DirectoryPickerDialog(
                         .heightIn(min = 160.dp, max = 280.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    if (subdirs.isEmpty()) {
+                    if (listing.isLoading) {
+                        item {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Text(
+                                    text = "Loading folders…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    } else if (subdirs.isEmpty()) {
                         item {
                             Text(
                                 text = "No readable subfolders",

@@ -26,16 +26,36 @@ class AgentForegroundService : Service() {
         val detail = intent?.getStringExtra(EXTRA_DETAIL) ?: "Working in background…"
         ensureChannel()
         val notification = buildNotification(detail)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        }
+        if (intent?.action == ACTION_STOP) {
+            isActive = false
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            stopSelfResult(startId)
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            isActive = true
         }
         return START_NOT_STICKY
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        isActive = false
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelfResult(startId)
+    }
+
+    override fun onDestroy() {
+        isActive = false
+        super.onDestroy()
     }
 
     private fun ensureChannel() {
@@ -80,8 +100,13 @@ class AgentForegroundService : Service() {
         private const val CHANNEL_ID = "antigravity_active_task"
         private const val NOTIFICATION_ID = 4789
         private const val EXTRA_DETAIL = "detail"
+        private const val ACTION_STOP = "com.hambalapps.agymobile.ACTION_STOP"
+
+        @Volatile
+        private var isActive = false
 
         fun start(context: Context, detail: String = "Working in background…") {
+            isActive = true
             runCatching {
                 val intent = Intent(context, AgentForegroundService::class.java)
                     .putExtra(EXTRA_DETAIL, detail)
@@ -94,8 +119,12 @@ class AgentForegroundService : Service() {
         }
 
         fun stop(context: Context) {
+            if (!isActive) return
+            isActive = false
             runCatching {
-                context.stopService(Intent(context, AgentForegroundService::class.java))
+                val intent = Intent(context, AgentForegroundService::class.java)
+                    .setAction(ACTION_STOP)
+                context.startService(intent)
             }
         }
     }

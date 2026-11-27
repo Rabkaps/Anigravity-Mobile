@@ -88,16 +88,21 @@ fun ElicitationSheet(
                         )
                     }
                 }
+                val parsedUrl = runCatching { Uri.parse(request.url) }.getOrNull()
+                val safeScheme = parsedUrl?.scheme?.lowercase() in setOf("http", "https")
                 Button(
                     onClick = {
-                        runCatching {
-                            context.startActivity(
-                                Intent(Intent.ACTION_VIEW, Uri.parse(request.url))
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            )
+                        if (safeScheme && parsedUrl != null) {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, parsedUrl)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                            onRespond("accept", emptyMap())
                         }
-                        onRespond("accept", emptyMap())
                     },
+                    enabled = safeScheme,
                     modifier = Modifier
                         .fillMaxWidth()
                         .defaultMinSize(minHeight = 48.dp),
@@ -154,8 +159,12 @@ fun ElicitationSheet(
                     ) {
                         Text("Decline")
                     }
+                    val missingRequired = request.fields.any { f ->
+                        f.required && formValues[f.key].isNullOrBlank()
+                    }
                     FilledTonalButton(
                         onClick = { onRespond("accept", formValues.toMap()) },
+                        enabled = !missingRequired,
                         modifier = Modifier
                             .weight(1f)
                             .defaultMinSize(minHeight = 48.dp),

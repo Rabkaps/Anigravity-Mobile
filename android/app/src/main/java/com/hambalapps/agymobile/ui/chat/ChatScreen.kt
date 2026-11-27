@@ -1,10 +1,7 @@
 package com.hambalapps.agymobile.ui.chat
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.graphics.BitmapFactory
 import android.util.Base64
-import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -30,18 +27,21 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -95,9 +95,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -106,12 +110,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.ui.components.AntigravityHeroEmblem
 import com.hambalapps.agymobile.ui.components.AntigravityStarfieldBackground
@@ -126,12 +133,15 @@ import com.hambalapps.agymobile.ui.sheets.DiffViewerSheet
 import com.hambalapps.agymobile.ui.sheets.ElicitationSheet
 import com.hambalapps.agymobile.ui.sheets.ModeAndModelSheet
 import com.hambalapps.agymobile.ui.sheets.SessionsDrawerContent
+import com.hambalapps.agymobile.ui.sheets.TasksDrawerContent
 import com.hambalapps.agymobile.ui.sheets.TerminalSheet
 import com.hambalapps.agymobile.ui.theme.LocalReducedMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 import com.hambalapps.agymobile.ui.theme.MonoCodeStyle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ChatScreen(
@@ -143,6 +153,7 @@ fun ChatScreen(
     onPickSystemFolder: ((String) -> Unit) -> Unit = {}
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val tasksDrawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
@@ -154,20 +165,65 @@ fun ChatScreen(
         else SlashCommandCatalog.filter(state.composerText, state.dynamicSlashCommands)
     }
 
+    LaunchedEffect(viewModel) {
+        viewModel.uiEffects.collect { effect ->
+            when (effect) {
+                ChatViewModel.UiEffect.OpenSessionsDrawer -> drawerState.open()
+                ChatViewModel.UiEffect.LaunchVoiceInput -> Unit
+            }
+        }
+    }
+
     LaunchedEffect(drawerState.isOpen) {
         if (drawerState.isOpen) {
             viewModel.refreshSessions()
         }
     }
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text?.length) {
-        if (state.messages.isNotEmpty()) {
+    val isNearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val total = info.totalItemsCount
+            if (total == 0) true
+            else {
+                val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                lastVisible >= total - 2
+            }
+        }
+    }
+
+    LaunchedEffect(state.messages.size) {
+        if (isNearBottom && state.messages.isNotEmpty()) {
             listState.animateScrollToItem(state.messages.lastIndex)
         }
     }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
+    LaunchedEffect(state.messages.lastOrNull()?.text?.length) {
+        if (isNearBottom && state.messages.isNotEmpty() && state.messages.lastOrNull()?.isStreaming == true) {
+            listState.scrollToItem(state.messages.lastIndex, Int.MAX_VALUE)
+        }
+    }
+
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        ModalNavigationDrawer(
+            drawerState = tasksDrawerState,
+            drawerContent = {
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    TasksDrawerContent(
+                        state = state,
+                        onStopTurn = viewModel::cancelTurn,
+                        onOpenDiff = {
+                            scope.launch { tasksDrawerState.close() }
+                            viewModel.openSheet(ActiveSheet.DIFF)
+                        },
+                        onClose = { scope.launch { tasksDrawerState.close() } }
+                    )
+                }
+            }
+        ) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                ModalNavigationDrawer(
+                    drawerState = drawerState,
         drawerContent = {
             SessionsDrawerContent(
                 workspaceCwd = state.workspaceCwd,
@@ -207,7 +263,6 @@ fun ChatScreen(
                         NavigationRailItem(
                             selected = false,
                             onClick = {
-                                viewModel.refreshSessions()
                                 scope.launch { drawerState.open() }
                             },
                             icon = { Icon(Icons.Rounded.Menu, contentDescription = "Sessions") },
@@ -249,13 +304,16 @@ fun ChatScreen(
                 Scaffold(
                     modifier = Modifier.weight(1f),
                     containerColor = MaterialTheme.colorScheme.background,
+                    contentWindowInsets = WindowInsets(0),
                     topBar = {
                         ExpressiveTopBar(
                             state = state,
                             showMenuButton = !isExpanded,
                             onOpenDrawer = {
-                                viewModel.refreshSessions()
                                 scope.launch { drawerState.open() }
+                            },
+                            onOpenTasksDrawer = {
+                                scope.launch { tasksDrawerState.open() }
                             },
                             onOpenModeSheet = { viewModel.openSheet(ActiveSheet.MODE_MODEL) },
                             onNewChat = viewModel::startFreshChat
@@ -266,8 +324,7 @@ fun ChatScreen(
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(innerPadding)
-                            .imePadding()
-                            .navigationBarsPadding()
+                            .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                     ) {
                         AnimatedVisibility(
                             visible = state.statusBanner != null,
@@ -310,6 +367,7 @@ fun ChatScreen(
                                 EmptyChatHero(
                                     state = state,
                                     onQuickPrompt = { prompt -> viewModel.sendPrompt(prompt) },
+                                    onPrefillPrompt = viewModel::updateComposerText,
                                     onStartStandaloneEngine = { includeToolchain ->
                                         viewModel.startStandaloneEngine(includeToolchain)
                                     },
@@ -354,6 +412,19 @@ fun ChatScreen(
                             )
                         }
 
+                        AnimatedVisibility(
+                            visible = state.btwSideNote != null,
+                            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+                            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+                        ) {
+                            state.btwSideNote?.let { note ->
+                                BtwSideNoteCard(
+                                    note = note,
+                                    onDismiss = viewModel::dismissBtwSideNote
+                                )
+                            }
+                        }
+
                         FloatingComposerSection(
                             state = state,
                             onTextChange = viewModel::updateComposerText,
@@ -369,9 +440,13 @@ fun ChatScreen(
                             onOpenModeSheet = { viewModel.openSheet(ActiveSheet.MODE_MODEL) },
                             onOpenDiffSheet = { viewModel.openSheet(ActiveSheet.DIFF) },
                             onOpenArtifactSheet = { viewModel.openSheet(ActiveSheet.ARTIFACT) },
-                            onOpenTerminal = viewModel::openTerminalSheet
+                            onOpenTerminal = viewModel::openTerminalSheet,
+                            onOpenTasksDrawer = { scope.launch { tasksDrawerState.open() } }
                         )
                     }
+                }
+            }
+        }
                 }
             }
         }
@@ -498,6 +573,7 @@ fun ChatScreen(
             bootstrapStatus = state.bootstrapStatus,
             standaloneInstalled = state.standaloneInstalled,
             standaloneToolchainInstalled = state.standaloneToolchainInstalled,
+            standaloneAndroidSdkInstalled = state.standaloneAndroidSdkInstalled,
             standaloneProgress = state.standaloneProgress,
             detectedAbi = state.detectedAbi,
             onStartStandaloneEngine = { includeToolchain ->
@@ -505,6 +581,7 @@ fun ChatScreen(
             },
             onUpdateStandaloneAgy = viewModel::updateStandaloneAgy,
             onInstallToolchain = viewModel::installStandaloneToolchain,
+            onInstallAndroidSdk = viewModel::installAndroidBuildSdk,
             onSaveProfile = viewModel::saveProfile,
             onDeleteProfile = viewModel::deleteProfile,
             onSelectProfile = viewModel::selectProfile,
@@ -523,6 +600,7 @@ internal fun ExpressiveTopBar(
     state: ChatUiState,
     showMenuButton: Boolean,
     onOpenDrawer: () -> Unit,
+    onOpenTasksDrawer: () -> Unit = {},
     onOpenModeSheet: () -> Unit,
     onNewChat: () -> Unit = {}
 ) {
@@ -596,6 +674,34 @@ internal fun ExpressiveTopBar(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+            }
+
+            val activeTaskCount = state.runningTasks.size + state.activeSubagents.count {
+                it.status.equals("running", ignoreCase = true) ||
+                    it.status.equals("in_progress", ignoreCase = true)
+            }
+            Box {
+                IconButton(onClick = onOpenTasksDrawer, modifier = Modifier.size(48.dp)) {
+                    Icon(
+                        imageVector = Icons.Rounded.Schedule,
+                        contentDescription = "Tasks and logs",
+                        tint = if (activeTaskCount > 0 || state.isStreaming) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    )
+                }
+                if (activeTaskCount > 0) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 8.dp, end = 8.dp)
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary)
+                    )
                 }
             }
 
@@ -703,9 +809,101 @@ private fun BrowserUrlBanner(
 }
 
 @Composable
+private fun BtwSideNoteCard(
+    note: BtwSideNoteUi,
+    onDismiss: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 6.dp),
+        shape = M3ExpressiveShape.Large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Surface(
+                    shape = M3ExpressiveShape.Full,
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    Text(
+                        text = "/btw",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+                Text(
+                    text = note.question,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Dismiss side note",
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+            if (note.isLoading && note.answer.isBlank()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ExpressiveLoadingIndicator()
+                    Text(
+                        text = "Answering side question…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            if (note.answer.isNotBlank()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 220.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    MarkdownText(markdown = note.answer)
+                }
+            }
+            if (!note.error.isNullOrBlank()) {
+                Text(
+                    text = note.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+    }
+}
+
+@Composable
 internal fun EmptyChatHero(
     state: ChatUiState,
     onQuickPrompt: (String) -> Unit,
+    onPrefillPrompt: (String) -> Unit = onQuickPrompt,
     onStartStandaloneEngine: (includeToolchain: Boolean) -> Unit = {},
     onUpdateStandaloneAgy: () -> Unit = {},
     onInstallToolchain: () -> Unit = {},
@@ -818,7 +1016,7 @@ internal fun EmptyChatHero(
                     icon = Icons.Rounded.Description,
                     title = "Plan a task",
                     subtitle = "Outline steps before editing files",
-                    onClick = { onQuickPrompt("/plan ") }
+                    onClick = { onPrefillPrompt("/plan ") }
                 )
                 QuickActionCard(
                     icon = Icons.Rounded.Extension,
@@ -1013,7 +1211,9 @@ internal fun MessageBubbleItem(
                 }
 
                 message.toolCalls.forEach { tool ->
-                    ToolCallCard(tool = tool, onOpenDiff = onOpenDiff)
+                    key(tool.toolCallId) {
+                        ToolCallCard(tool = tool, onOpenDiff = onOpenDiff)
+                    }
                 }
 
                 if (message.text.isNotBlank()) {
@@ -1183,15 +1383,24 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
 
             // Inline screenshot preview from `android_screenshot`
             tool.imageBase64?.let { b64 ->
-                val bitmap = remember(b64) {
-                    runCatching {
-                        val bytes = Base64.decode(b64, Base64.DEFAULT)
-                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                    }.getOrNull()
+                val bitmap by produceState<ImageBitmap?>(initialValue = null, key1 = b64) {
+                    value = withContext(Dispatchers.Default) {
+                        runCatching {
+                            val bytes = Base64.decode(b64, Base64.DEFAULT)
+                            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                            var sample = 1
+                            while ((bounds.outWidth / sample) > 1080 || (bounds.outHeight / sample) > 1080) {
+                                sample *= 2
+                            }
+                            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.asImageBitmap()
+                        }.getOrNull()
+                    }
                 }
-                if (bitmap != null) {
+                bitmap?.let { decoded ->
                     Image(
-                        bitmap = bitmap,
+                        bitmap = decoded,
                         contentDescription = "Android screen capture",
                         contentScale = ContentScale.FillWidth,
                         modifier = Modifier
@@ -1244,7 +1453,8 @@ internal fun FloatingComposerSection(
     onOpenModeSheet: () -> Unit,
     onOpenDiffSheet: () -> Unit,
     onOpenArtifactSheet: () -> Unit,
-    onOpenTerminal: () -> Unit
+    onOpenTerminal: () -> Unit,
+    onOpenTasksDrawer: () -> Unit = {}
 ) {
     var toolsExpanded by remember { mutableStateOf(false) }
     val activeSubagents = remember(state.activeSubagents) {
@@ -1269,7 +1479,8 @@ internal fun FloatingComposerSection(
             RunningTasksPill(
                 runningTools = state.runningTasks,
                 runningSubagents = activeSubagents,
-                onStop = onStop
+                onStop = onStop,
+                onOpenTasksDrawer = onOpenTasksDrawer
             )
         }
 
@@ -1465,7 +1676,8 @@ internal fun FloatingComposerSection(
 private fun RunningTasksPill(
     runningTools: List<ToolCallUi>,
     runningSubagents: List<com.hambalapps.agymobile.data.acp.AcpSubagentInfo>,
-    onStop: () -> Unit = {}
+    onStop: () -> Unit = {},
+    onOpenTasksDrawer: () -> Unit = {}
 ) {
     var expanded by remember { mutableStateOf(false) }
     val totalCount = runningTools.size + runningSubagents.size
@@ -1504,6 +1716,18 @@ private fun RunningTasksPill(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                Surface(
+                    onClick = onOpenTasksDrawer,
+                    shape = M3ExpressiveShape.Full,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                ) {
+                    Text(
+                        text = "Logs",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
                 IconButton(
                     onClick = onStop,
                     modifier = Modifier.size(28.dp)

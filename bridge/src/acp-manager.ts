@@ -41,7 +41,9 @@ export function stripModelEffortSuffix(modelId: string): string {
 function parseOptionalNumber(val: unknown): number | undefined {
   if (typeof val === "number" && Number.isFinite(val)) return val;
   if (typeof val === "string") {
-    const parsed = Number(val);
+    const trimmed = val.trim();
+    if (trimmed.length === 0) return undefined;
+    const parsed = Number(trimmed);
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
@@ -259,18 +261,29 @@ export class AcpManager extends EventEmitter {
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
       this.stdoutBuffer += chunk;
+      let start = 0;
       let nlIndex: number;
-      while ((nlIndex = this.stdoutBuffer.indexOf("\n")) !== -1) {
-        const line = this.stdoutBuffer.slice(0, nlIndex).trim();
-        this.stdoutBuffer = this.stdoutBuffer.slice(nlIndex + 1);
+      while ((nlIndex = this.stdoutBuffer.indexOf("\n", start)) !== -1) {
+        const line = this.stdoutBuffer.slice(start, nlIndex).trim();
+        start = nlIndex + 1;
         if (!line) continue;
         try {
           const parsed = JSON.parse(line) as JsonRpcMessage;
           this.emit("message", parsed);
-        } catch (err) {
+        } catch {
           this.emit("stderr", `[agy-bridge] Non-JSON stdout from agy acp: ${line}\n`);
         }
       }
+      if (start > 0) {
+        this.stdoutBuffer = this.stdoutBuffer.slice(start);
+      }
+      if (this.stdoutBuffer.length > 32 * 1024 * 1024) {
+        this.stdoutBuffer = "";
+      }
+    });
+
+    proc.stdin.on("error", () => {
+      // Ignore EPIPE when agy acp exits mid-write.
     });
 
     proc.stderr.setEncoding("utf8");
@@ -279,13 +292,17 @@ export class AcpManager extends EventEmitter {
     });
 
     proc.on("exit", (code, signal) => {
-      this.proc = null;
-      this.emit("exit", { code, signal });
+      if (this.proc === proc) {
+        this.proc = null;
+        this.emit("exit", { code, signal });
+      }
     });
 
     proc.on("error", (err) => {
-      this.proc = null;
-      this.emit("error", err);
+      if (this.proc === proc) {
+        this.proc = null;
+        this.emit("error", err);
+      }
     });
   }
 
@@ -410,18 +427,22 @@ export class AcpManager extends EventEmitter {
     const dir = getAgySessionsDir();
     try {
       const entries = await fs.readdir(dir, { withFileTypes: true });
-      const summaries: SessionSummary[] = [];
-      for (const entry of entries.slice(0, 50)) {
-        const fullPath = path.join(dir, entry.name);
-        const stat = await fs.stat(fullPath);
-        summaries.push({
-          id: entry.name.replace(/\.json$/, ""),
-          title: entry.name.replace(/\.json$/, ""),
-          cwd: this.activeCwd,
-          updatedAt: stat.mtime.toISOString(),
-        });
-      }
-      return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const stats = await Promise.allSettled(
+        entries.map(async (entry) => {
+          const fullPath = path.join(dir, entry.name);
+          const stat = await fs.stat(fullPath);
+          return {
+            id: entry.name.replace(/\.(json|db)$/, ""),
+            title: entry.name.replace(/\.(json|db)$/, ""),
+            cwd: this.activeCwd,
+            updatedAt: stat.mtime.toISOString(),
+          };
+        })
+      );
+      const summaries = stats
+        .filter((r): r is PromiseFulfilledResult<SessionSummary> => r.status === "fulfilled")
+        .map((r) => r.value);
+      return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 50);
     } catch {
       return [];
     }
@@ -430,29 +451,37 @@ export class AcpManager extends EventEmitter {
   async getGitDiff(cwdOverride?: string): Promise<{ cwd: string; files: DiffFileEntry[] }> {
     const targetCwd = cwdOverride || this.activeCwd;
     try {
-      const { stdout: statusOut } = await execFileAsync("git", ["status", "--porcelain"], {
+      const { stdout: statusOut } = await execFileAsync("git", ["status", "--porcelain", "-z"], {
         cwd: targetCwd,
         timeout: 6000,
       });
-      const lines = statusOut
-        .split(/\r?\n/)
-        .map((l) => l.trimEnd())
-        .filter(Boolean);
-
+      const tokens = statusOut.split("\u0000").filter(Boolean);
       const files: DiffFileEntry[] = [];
-      for (const line of lines.slice(0, 40)) {
-        const code = line.slice(0, 2).trim();
-        const filePath = line.slice(3).trim();
+      let i = 0;
+      while (i < tokens.length && files.length < 40) {
+        const entry = tokens[i++];
+        const code = entry.slice(0, 2).trim();
+        const filePath = entry.slice(3);
+        if (code.includes("R") || code.includes("C")) {
+          // Skip original path token for renames/copies in -z format
+          i++;
+        }
         let diffText = "";
         try {
-          const { stdout } = await execFileAsync("git", ["diff", "HEAD", "--", filePath], {
+          const args =
+            code === "??"
+              ? ["diff", "--no-index", "/dev/null", "--", filePath]
+              : ["diff", "HEAD", "--", filePath];
+          const { stdout } = await execFileAsync("git", args, {
             cwd: targetCwd,
             timeout: 5000,
             maxBuffer: 2 * 1024 * 1024,
           });
           diffText = stdout;
-        } catch {
-          diffText = "";
+        } catch (err: unknown) {
+          // git diff --no-index exits 1 when differences exist, placing diff in stdout
+          const execErr = err as { stdout?: string };
+          diffText = typeof execErr?.stdout === "string" ? execErr.stdout : "";
         }
 
         const status: DiffFileEntry["status"] =

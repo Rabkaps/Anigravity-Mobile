@@ -5,10 +5,14 @@ import com.hambalapps.agymobile.data.local.ConnectionProfile
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -17,12 +21,14 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.io.BufferedWriter
 import java.io.File
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.concurrent.TimeUnit
 
 class PtyWebSocketClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> })
@@ -35,9 +41,14 @@ class PtyWebSocketClient(
     private val _detectedUrl = MutableStateFlow<String?>(null)
     val detectedUrl: StateFlow<String?> = _detectedUrl.asStateFlow()
 
+    @Volatile
     private var socket: WebSocket? = null
+    @Volatile
     private var localProc: Process? = null
+    @Volatile
     private var localWriter: BufferedWriter? = null
+    private val writeLock = Any()
+    private var localJob: Job? = null
 
     fun connect(profile: ConnectionProfile) {
         disconnect()
@@ -50,31 +61,38 @@ class PtyWebSocketClient(
             }
             .build()
 
-        socket = httpClient.newWebSocket(req, object : WebSocketListener() {
+        val ws = httpClient.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (webSocket !== socket) return
                 _connected.value = true
                 appendOutput("[connected to ${profile.name} shell]\n")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (webSocket !== socket) return
                 appendOutput(text)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (webSocket !== socket) return
+                socket = null
                 _connected.value = false
                 appendOutput("\n[disconnected: $reason]\n")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (webSocket !== socket) return
+                socket = null
                 _connected.value = false
                 appendOutput("\n[terminal error: ${t.message}]\n")
             }
         })
+        socket = ws
     }
 
     fun connectLocal(engineManager: StandaloneEngineManager, cwd: String) {
         disconnect()
-        scope.launch {
+        localJob = scope.launch {
             runCatching {
                 engineManager.ensureBaseDirs()
                 val workDir = cwd.takeIf { it.isNotBlank() && File(it).exists() }?.let(::File)
@@ -90,21 +108,24 @@ class PtyWebSocketClient(
                 pb.environment().putAll(engineManager.buildChildEnvironment())
                 val proc = pb.start()
                 localProc = proc
-                localWriter = BufferedWriter(OutputStreamWriter(proc.outputStream, Charsets.UTF_8))
+                synchronized(writeLock) {
+                    localWriter = BufferedWriter(OutputStreamWriter(proc.outputStream, Charsets.UTF_8))
+                }
                 _connected.value = true
                 appendOutput("[connected to standalone shell (${engineManager.detectArch().abi})]\n")
 
-                val buf = ByteArray(4096)
-                val inp = proc.inputStream
-                while (true) {
-                    val n = inp.read(buf)
-                    if (n <= 0) break
-                    appendOutput(String(buf, 0, n, Charsets.UTF_8))
+                val buf = CharArray(4096)
+                InputStreamReader(proc.inputStream, Charsets.UTF_8).use { reader ->
+                    while (isActive) {
+                        val n = reader.read(buf)
+                        if (n <= 0) break
+                        appendOutput(String(buf, 0, n))
+                    }
                 }
                 val code = proc.waitFor()
                 if (localProc === proc) {
                     localProc = null
-                    localWriter = null
+                    synchronized(writeLock) { localWriter = null }
                     _connected.value = false
                     appendOutput("\n[shell exited with code $code]\n")
                 }
@@ -117,12 +138,14 @@ class PtyWebSocketClient(
 
     fun sendCommand(line: String) {
         socket?.send(line + "\n")
-        val w = localWriter
-        if (w != null) {
+        if (localWriter != null) {
             scope.launch {
-                runCatching {
-                    w.write(line + "\n")
-                    w.flush()
+                synchronized(writeLock) {
+                    val w = localWriter ?: return@synchronized
+                    runCatching {
+                        w.write(line + "\n")
+                        w.flush()
+                    }
                 }
             }
         }
@@ -130,17 +153,14 @@ class PtyWebSocketClient(
 
     fun sendRaw(text: String) {
         socket?.send(text)
-        val w = localWriter
-        if (w != null) {
+        if (localWriter != null) {
             scope.launch {
-                runCatching {
-                    if (text == "\u0003") {
-                        // Interrupt local shell by restarting cleanly if Ctrl+C is tapped.
-                        w.write("\u0003")
-                    } else {
+                synchronized(writeLock) {
+                    val w = localWriter ?: return@synchronized
+                    runCatching {
                         w.write(text)
+                        w.flush()
                     }
-                    w.flush()
                 }
             }
         }
@@ -152,25 +172,35 @@ class PtyWebSocketClient(
     }
 
     fun disconnect() {
-        socket?.close(1000, "Terminal closed")
+        localJob?.cancel()
+        localJob = null
+        val oldSocket = socket
         socket = null
-        runCatching { localWriter?.close() }
-        localWriter = null
-        runCatching { localProc?.destroy() }
+        oldSocket?.close(1000, "Terminal closed")
+        synchronized(writeLock) {
+            runCatching { localWriter?.close() }
+            localWriter = null
+        }
+        runCatching { localProc?.destroyForcibly() }
         localProc = null
         _connected.value = false
         _detectedUrl.value = null
     }
 
+    fun close() {
+        disconnect()
+        scope.cancel()
+    }
+
     private fun appendOutput(chunk: String) {
-        val combined = _output.value + chunk
-        val trimmed = if (combined.length > 24_000) {
-            combined.takeLast(24_000)
-        } else {
-            combined
+        var latest = ""
+        _output.update { current ->
+            val combined = current + chunk
+            val trimmed = if (combined.length > 24_000) combined.takeLast(24_000) else combined
+            latest = trimmed
+            trimmed
         }
-        _output.value = trimmed
-        extractLatestUrl(trimmed)?.let { url ->
+        extractLatestUrl(latest)?.let { url ->
             if (_detectedUrl.value != url) {
                 _detectedUrl.value = url
             }

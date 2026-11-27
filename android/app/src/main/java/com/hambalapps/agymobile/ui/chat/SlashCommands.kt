@@ -191,7 +191,7 @@ object SlashCommandCatalog {
             category = "Utilities",
             description = "Ask a quick side question without altering context",
             argHint = "<query>",
-            target = SlashCommandTarget.AGENT_PROMPT
+            target = SlashCommandTarget.LOCAL_ACTION
         ),
         SlashCommandSpec(
             command = "/learn",

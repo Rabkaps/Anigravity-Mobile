@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -50,6 +51,8 @@ fun PermissionRequestSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .navigationBarsPadding()
                 .padding(horizontal = 20.dp)
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -125,45 +128,57 @@ fun PermissionRequestSheet(
             }
 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                request.options.forEach { option ->
-                    val isReject = option.kind.startsWith("reject")
-                    val isAlways = option.kind == "allow_always"
+                if (request.options.isEmpty()) {
+                    OutlinedButton(
+                        onClick = { onRespond(null) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .defaultMinSize(minHeight = 48.dp),
+                        shape = M3ExpressiveShape.Full
+                    ) {
+                        Text("Cancel")
+                    }
+                } else {
+                    request.options.forEach { option ->
+                        val isReject = option.kind.startsWith("reject")
+                        val isAlways = option.kind == "allow_always"
 
-                    when {
-                        isReject -> {
-                            OutlinedButton(
-                                onClick = { onRespond(option.optionId) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .defaultMinSize(minHeight = 48.dp),
-                                shape = M3ExpressiveShape.Full,
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = MaterialTheme.colorScheme.error
-                                )
-                            ) {
-                                Text(option.name)
+                        when {
+                            isReject -> {
+                                OutlinedButton(
+                                    onClick = { onRespond(option.optionId) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .defaultMinSize(minHeight = 48.dp),
+                                    shape = M3ExpressiveShape.Full,
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = MaterialTheme.colorScheme.error
+                                    )
+                                ) {
+                                    Text(option.name)
+                                }
                             }
-                        }
-                        isAlways -> {
-                            FilledTonalButton(
-                                onClick = { onRespond(option.optionId) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .defaultMinSize(minHeight = 48.dp),
-                                shape = M3ExpressiveShape.Full
-                            ) {
-                                Text(option.name)
+                            isAlways -> {
+                                FilledTonalButton(
+                                    onClick = { onRespond(option.optionId) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .defaultMinSize(minHeight = 48.dp),
+                                    shape = M3ExpressiveShape.Full
+                                ) {
+                                    Text(option.name)
+                                }
                             }
-                        }
-                        else -> {
-                            Button(
-                                onClick = { onRespond(option.optionId) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .defaultMinSize(minHeight = 48.dp),
-                                shape = M3ExpressiveShape.Full
-                            ) {
-                                Text(option.name)
+                            else -> {
+                                Button(
+                                    onClick = { onRespond(option.optionId) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .defaultMinSize(minHeight = 48.dp),
+                                    shape = M3ExpressiveShape.Full
+                                ) {
+                                    Text(option.name)
+                                }
                             }
                         }
                     }

@@ -267,7 +267,12 @@ fun AuthSheet(
                                     IconButton(
                                         onClick = {
                                             val cm = context.getSystemService(ClipboardManager::class.java)
-                                            val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                                            val primaryClip = cm?.primaryClip
+                                            val clip = if (primaryClip != null && primaryClip.itemCount > 0) {
+                                                primaryClip.getItemAt(0)?.text?.toString().orEmpty()
+                                            } else {
+                                                ""
+                                            }
                                             if (clip.isNotBlank()) {
                                                 authCodeText = clip
                                             }
@@ -358,13 +363,17 @@ fun AuthSheet(
                                         method.id == "gemini-api-key" -> showApiKeyInput = true
                                         method.type == "terminal" -> {
                                             val args = if (method.args.isNotEmpty()) {
-                                                method.args.joinToString(" ")
+                                                method.args.joinToString(" ") { posixSingleQuote(it) }
                                             } else {
                                                 "acp --login"
                                             }
                                             val envPrefix = method.env.entries.joinToString(" ") { (k, v) ->
-                                                "$k=$v"
-                                            }
+                                                if (Regex("^[A-Za-z_][A-Za-z0-9_]*$").matches(k)) {
+                                                    "$k=${posixSingleQuote(v)}"
+                                                } else {
+                                                    ""
+                                                }
+                                            }.trim()
                                             val cmd = if (envPrefix.isBlank()) "agy $args" else "$envPrefix agy $args"
                                             onOpenTerminalLogin(cmd)
                                         }
@@ -522,3 +531,6 @@ fun AuthSheet(
         }
     }
 }
+
+private fun posixSingleQuote(value: String): String =
+    "'" + value.replace("'", "'\"'\"'") + "'"
