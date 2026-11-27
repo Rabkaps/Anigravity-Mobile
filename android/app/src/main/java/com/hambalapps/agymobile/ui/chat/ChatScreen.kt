@@ -51,6 +51,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Build
@@ -68,13 +69,16 @@ import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -343,6 +347,7 @@ fun ChatScreen(
                             onTextChange = viewModel::updateComposerText,
                             onSend = { viewModel.sendPrompt() },
                             onStop = viewModel::cancelTurn,
+                            onRemoveQueuedMessage = viewModel::removeQueuedMessage,
                             onSlashTap = { viewModel.updateComposerText("/") },
                             onVoiceTap = onRequestVoice,
                             onOpenModeSheet = { viewModel.openSheet(ActiveSheet.MODE_MODEL) },
@@ -1072,12 +1077,20 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
                     color = iconTint.copy(alpha = 0.14f)
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = if (isDone) Icons.Rounded.CheckCircle else Icons.Rounded.Build,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = iconTint
-                        )
+                        if (isDone) {
+                            Icon(
+                                imageVector = Icons.Rounded.CheckCircle,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = iconTint
+                            )
+                        } else {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp),
+                                color = iconTint
+                            )
+                        }
                     }
                 }
                 Column(modifier = Modifier.weight(1f)) {
@@ -1087,13 +1100,15 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Text(
-                        text = tool.diffPath ?: tool.status,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    if (tool.diffPath != null) {
+                        Text(
+                            text = tool.diffPath,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
                 if (tool.diffPath != null) {
                     Surface(
@@ -1170,6 +1185,7 @@ internal fun FloatingComposerSection(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onRemoveQueuedMessage: (String) -> Unit = {},
     onSlashTap: () -> Unit,
     onVoiceTap: () -> Unit,
     onOpenModeSheet: () -> Unit,
@@ -1178,6 +1194,13 @@ internal fun FloatingComposerSection(
     onOpenTerminal: () -> Unit
 ) {
     var toolsExpanded by remember { mutableStateOf(false) }
+    val activeSubagents = remember(state.activeSubagents) {
+        state.activeSubagents.filter {
+            it.status.equals("running", ignoreCase = true) ||
+                it.status.equals("in_progress", ignoreCase = true)
+        }
+    }
+    val hasRunningTasks = state.runningTasks.isNotEmpty() || activeSubagents.isNotEmpty()
 
     Column(
         modifier = Modifier
@@ -1185,6 +1208,27 @@ internal fun FloatingComposerSection(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
+        AnimatedVisibility(
+            visible = hasRunningTasks,
+            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+        ) {
+            RunningTasksPill(
+                runningTools = state.runningTasks,
+                runningSubagents = activeSubagents
+            )
+        }
+
+        AnimatedVisibility(
+            visible = state.queuedMessages.isNotEmpty(),
+            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+        ) {
+            QueuedMessagesStrip(
+                queuedMessages = state.queuedMessages,
+                onRemove = onRemoveQueuedMessage
+            )
+        }
         AnimatedVisibility(
             visible = toolsExpanded,
             enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
@@ -1280,7 +1324,9 @@ internal fun FloatingComposerSection(
                         Text(
                             text = "Message Antigravity…",
                             style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                     BasicTextField(
@@ -1310,12 +1356,164 @@ internal fun FloatingComposerSection(
                     )
                 }
 
+                if (state.isStreaming && state.composerText.isNotBlank()) {
+                    FilledTonalIconButton(
+                        onClick = onSend,
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.Send,
+                            contentDescription = "Queue message"
+                        )
+                    }
+                }
+
                 MorphingActionButton(
                     isStreaming = state.isStreaming,
                     enabled = state.composerText.isNotBlank(),
                     onSend = onSend,
                     onStop = onStop
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RunningTasksPill(
+    runningTools: List<ToolCallUi>,
+    runningSubagents: List<com.hambalapps.agymobile.data.acp.AcpSubagentInfo>
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val totalCount = runningTools.size + runningSubagents.size
+    val primaryLabel = runningTools.firstOrNull()?.title
+        ?: runningSubagents.firstOrNull()?.role
+        ?: "Running task"
+
+    Surface(
+        onClick = { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth(),
+        shape = M3ExpressiveShape.LargeIncreased,
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                ExpressiveLoadingIndicator(modifier = Modifier.size(20.dp))
+                Text(
+                    text = if (totalCount == 1) {
+                        "1 task running · $primaryLabel"
+                    } else {
+                        "$totalCount tasks running"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(
+                    imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                    contentDescription = if (expanded) "Collapse tasks" else "Expand tasks",
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+            AnimatedVisibility(
+                visible = expanded,
+                enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+                exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    runningTools.forEach { tool ->
+                        Text(
+                            text = "• ${tool.title}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    runningSubagents.forEach { agent ->
+                        Text(
+                            text = "• ${agent.role}: ${agent.status}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QueuedMessagesStrip(
+    queuedMessages: List<QueuedMessageUi>,
+    onRemove: (String) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        queuedMessages.forEach { item ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = M3ExpressiveShape.Large,
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Schedule,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Text(
+                        text = "Queued",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = item.text,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            textDirection = detectTextDirection(item.text)
+                        ),
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = { onRemove(item.id) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Remove queued message",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
             }
         }
     }

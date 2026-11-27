@@ -676,10 +676,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendPrompt(overridePrompt: String? = null) {
         val raw = (overridePrompt ?: _uiState.value.composerText).trim()
-        if (raw.isEmpty() || _uiState.value.isStreaming) return
+        if (raw.isEmpty()) return
 
         // Handle local slash commands typed manually and submitted
-        if (raw.startsWith("/")) {
+        if (raw.startsWith("/") && !_uiState.value.isStreaming) {
             val head = raw.substringBefore(' ').lowercase()
             val matched = SlashCommandCatalog.builtIn.firstOrNull {
                 it.command == head || it.aliases.contains(head)
@@ -693,6 +693,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 return
             }
+        }
+
+        if (_uiState.value.isStreaming) {
+            if (raw.startsWith("/")) return
+            val queued = QueuedMessageUi(text = raw)
+            _uiState.update { state ->
+                state.copy(
+                    composerText = if (overridePrompt == null) "" else state.composerText,
+                    queuedMessages = state.queuedMessages + queued
+                )
+            }
+            return
         }
 
         val sessionId = _uiState.value.sessionId
@@ -753,12 +765,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun removeQueuedMessage(id: String) {
+        _uiState.update { state ->
+            state.copy(queuedMessages = state.queuedMessages.filterNot { it.id == id })
+        }
+    }
+
     fun startFreshChat() {
         activeAgentMessageId = null
         activeUserMessageId = null
         _uiState.update {
             it.copy(
                 messages = emptyList(),
+                queuedMessages = emptyList(),
                 activeSubagents = emptyList(),
                 isStreaming = false,
                 usedTokens = 0,
@@ -804,6 +823,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 messages = emptyList(),
+                queuedMessages = emptyList(),
                 activeSubagents = emptyList(),
                 isStreaming = false,
                 statusBanner = null
@@ -1056,6 +1076,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 ),
                 activeSubagents = emptyList(),
+                queuedMessages = emptyList(),
                 isStreaming = false,
                 usedTokens = 0,
                 statusBanner = null
@@ -1936,9 +1957,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun finalizeAgentTurn() {
         val targetId = activeAgentMessageId
         activeAgentMessageId = null
+        val nextQueued = _uiState.value.queuedMessages.firstOrNull()
         _uiState.update { state ->
             state.copy(
                 isStreaming = false,
+                queuedMessages = if (nextQueued != null) state.queuedMessages.drop(1) else state.queuedMessages,
                 messages = state.messages.map { msg ->
                     if (msg.id == targetId) msg.copy(isStreaming = false) else msg
                 }
@@ -1946,6 +1969,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         refreshDiff()
         refreshQuota()
+        if (nextQueued != null) {
+            sendPrompt(overridePrompt = nextQueued.text)
+        }
     }
 
     private fun appendAgentError(errorText: String) {

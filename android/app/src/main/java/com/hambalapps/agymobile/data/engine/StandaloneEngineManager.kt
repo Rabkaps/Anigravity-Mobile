@@ -626,8 +626,9 @@ if [ -z "${'$'}URL" ]; then
   echo "Usage: ${'$'}0 <url>" >&2
   exit 1
 fi
-SPOOL_DIR="${'$'}{TMPDIR:-$defaultSpool}/browser_open"
-if [ "${'$'}SPOOL_DIR" = "/browser_open" ]; then
+if [ -n "${'$'}TMPDIR" ]; then
+  SPOOL_DIR="${'$'}TMPDIR/browser_open"
+else
   SPOOL_DIR="$defaultSpool"
 fi
 mkdir -p "${'$'}SPOOL_DIR" 2>/dev/null

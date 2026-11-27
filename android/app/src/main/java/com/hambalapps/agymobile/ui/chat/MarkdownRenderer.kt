@@ -294,6 +294,15 @@ private fun buildInlineStyled(
     inlineCodeFg: Color,
     linkColor: Color
 ): AnnotatedString = buildAnnotatedString {
+    appendInlineStyled(input, inlineCodeBg, inlineCodeFg, linkColor)
+}
+
+private fun AnnotatedString.Builder.appendInlineStyled(
+    input: String,
+    inlineCodeBg: Color,
+    inlineCodeFg: Color,
+    linkColor: Color
+) {
     var i = 0
     while (i < input.length) {
         when {
@@ -329,7 +338,7 @@ private fun buildInlineStyled(
                 val end = input.indexOf("**", i + 2)
                 if (end > i + 2) {
                     withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                        append(input.substring(i + 2, end))
+                        appendInlineStyled(input.substring(i + 2, end), inlineCodeBg, inlineCodeFg, linkColor)
                     }
                     i = end + 2
                 } else {
@@ -359,7 +368,7 @@ private fun buildInlineStyled(
                 val end = input.indexOf('*', i + 1)
                 if (end > i + 1) {
                     withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                        append(input.substring(i + 1, end))
+                        appendInlineStyled(input.substring(i + 1, end), inlineCodeBg, inlineCodeFg, linkColor)
                     }
                     i = end + 1
                 } else {

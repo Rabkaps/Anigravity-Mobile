@@ -54,6 +54,11 @@ data class ChatMessageUi(
     val isStreaming: Boolean = false
 )
 
+data class QueuedMessageUi(
+    val id: String = UUID.randomUUID().toString(),
+    val text: String
+)
+
 enum class ActiveSheet {
     NONE,
     AUTH,
@@ -81,6 +86,7 @@ data class ChatUiState(
     val extraDirs: List<String> = emptyList(),
     val messages: List<ChatMessageUi> = emptyList(),
     val composerText: String = "",
+    val queuedMessages: List<QueuedMessageUi> = emptyList(),
     val isStreaming: Boolean = false,
     val configOptions: List<AcpConfigOption> = emptyList(),
     val usedTokens: Int = 0,
@@ -154,6 +160,11 @@ data class ChatUiState(
 
     val currentElicitation: AcpElicitationRequest?
         get() = elicitationQueue.firstOrNull()
+
+    val runningTasks: List<ToolCallUi>
+        get() = messages.flatMap { it.toolCalls }.filter {
+            it.status.lowercase() !in setOf("completed", "failed", "error", "cancelled", "done")
+        }
 
     fun quotaForModelChoice(choiceValue: String, choiceName: String = ""): ModelQuotaInfo? {
         val summary = quotaSummary ?: return null
