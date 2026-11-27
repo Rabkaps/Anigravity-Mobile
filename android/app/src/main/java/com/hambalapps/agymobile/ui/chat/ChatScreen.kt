@@ -6,12 +6,19 @@ import android.graphics.BitmapFactory
 import android.util.Base64
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -40,12 +47,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Difference
@@ -85,6 +96,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -93,12 +106,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
+import com.hambalapps.agymobile.ui.components.AntigravityHeroEmblem
+import com.hambalapps.agymobile.ui.components.AntigravityStarfieldBackground
 import com.hambalapps.agymobile.ui.components.BridgeConnectionState
-import com.hambalapps.agymobile.ui.components.ContextRingIndicator
 import com.hambalapps.agymobile.ui.components.ExpressiveLoadingIndicator
-import com.hambalapps.agymobile.ui.components.FloatingPillToolbar
 import com.hambalapps.agymobile.ui.components.MorphingActionButton
-import com.hambalapps.agymobile.ui.components.PrivilegeBadge
 import com.hambalapps.agymobile.ui.settings.ConnectionSettingsSheet
 import com.hambalapps.agymobile.ui.sheets.AgentsAndMcpSheet
 import com.hambalapps.agymobile.ui.sheets.ArtifactReviewSheet
@@ -108,6 +120,7 @@ import com.hambalapps.agymobile.ui.sheets.ElicitationSheet
 import com.hambalapps.agymobile.ui.sheets.ModeAndModelSheet
 import com.hambalapps.agymobile.ui.sheets.SessionsDrawerContent
 import com.hambalapps.agymobile.ui.sheets.TerminalSheet
+import com.hambalapps.agymobile.ui.theme.LocalReducedMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 import com.hambalapps.agymobile.ui.theme.MonoCodeStyle
@@ -227,7 +240,7 @@ fun ChatScreen(
                                 scope.launch { drawerState.open() }
                             },
                             onOpenModeSheet = { viewModel.openSheet(ActiveSheet.MODE_MODEL) },
-                            onOpenMcpSheet = { viewModel.openSheet(ActiveSheet.AGENTS_MCP) }
+                            onNewChat = viewModel::startFreshChat
                         )
                     }
                 ) { innerPadding ->
@@ -376,7 +389,10 @@ fun ChatScreen(
             onOpenAuth = { viewModel.openSheet(ActiveSheet.AUTH) },
             onDismiss = viewModel::closeSheet,
             isSignedIn = state.standaloneSignedIn || state.sessionId != null,
-            onLogout = viewModel::logoutFromAgent
+            onLogout = viewModel::logoutFromAgent,
+            connectionState = state.connectionState,
+            profileName = state.activeProfile?.name ?: "Local",
+            onOpenSettings = { viewModel.openSheet(ActiveSheet.SETTINGS) }
         )
         ActiveSheet.DIFF -> DiffViewerSheet(
             files = state.diffFiles,
@@ -456,6 +472,7 @@ fun ChatScreen(
             onTestConnection = viewModel::testConnection,
             onToggleAmoled = viewModel::setAmoledDark,
             onToggleDynamicColor = viewModel::setDynamicColor,
+            onSelectThemeMode = viewModel::setThemeMode,
             onDismiss = viewModel::closeSheet
         )
         ActiveSheet.NONE -> Unit
@@ -468,11 +485,20 @@ internal fun ExpressiveTopBar(
     showMenuButton: Boolean,
     onOpenDrawer: () -> Unit,
     onOpenModeSheet: () -> Unit,
-    onOpenMcpSheet: () -> Unit
+    onNewChat: () -> Unit = {}
 ) {
+    val statusDotColor = when (state.connectionState) {
+        BridgeConnectionState.CONNECTED -> MaterialTheme.colorScheme.tertiary
+        BridgeConnectionState.CONNECTING -> MaterialTheme.colorScheme.primary
+        BridgeConnectionState.ERROR -> MaterialTheme.colorScheme.error
+        BridgeConnectionState.DISCONNECTED -> MaterialTheme.colorScheme.outline
+    }
+    val modelPillLabel = state.activeModelLabel
+        .takeIf { it != "connect to load" }
+        ?: (state.activeProfile?.name ?: "Antigravity")
+
     Surface(
         color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 1.dp,
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding()
@@ -480,54 +506,63 @@ internal fun ExpressiveTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             if (showMenuButton) {
                 IconButton(onClick = onOpenDrawer, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Rounded.Menu, contentDescription = "Open drawer")
                 }
+            } else {
+                Spacer(Modifier.size(48.dp))
             }
 
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(M3ExpressiveShape.Large)
-                    .clickable(onClick = onOpenModeSheet)
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            Box(
+                modifier = Modifier.weight(1f),
+                contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = state.activeProfile?.name ?: "Agy Mobile",
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                val subtitleParts = buildList {
-                    add(state.activeModeLabel)
-                    if (state.activeEffortLabel.isNotBlank()) add(state.activeEffortLabel)
-                    add(state.activeModelLabel)
+                Surface(
+                    onClick = onOpenModeSheet,
+                    shape = M3ExpressiveShape.Full,
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 40.dp)
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(statusDotColor)
+                        )
+                        Text(
+                            text = modelPillLabel,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Icon(
+                            imageVector = Icons.Rounded.ExpandMore,
+                            contentDescription = "Select model and mode",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
-                Text(
-                    text = subtitleParts.joinToString(" • "),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
             }
 
-            PrivilegeBadge(
-                privilegeLevel = state.health?.privilegeLevel ?: "none",
-                connectionState = state.connectionState,
-                isRemote = state.activeProfile?.isRemote ?: false,
-                onClick = onOpenMcpSheet
-            )
-
-            ContextRingIndicator(
-                usageRatio = state.contextUsageRatio,
-                onClick = onOpenModeSheet
-            )
+            IconButton(onClick = onNewChat, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Rounded.Add, contentDescription = "New chat")
+            }
         }
     }
 }
@@ -577,7 +612,6 @@ private fun StatusNoticeBanner(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun EmptyChatHero(
     state: ChatUiState,
@@ -591,72 +625,45 @@ internal fun EmptyChatHero(
     onOpenTerminal: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
-    val context = LocalContext.current
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.Start
-    ) {
-        Surface(
-            shape = M3ExpressiveShape.ExtraLarge,
-            color = MaterialTheme.colorScheme.primaryContainer
+    Box(modifier = Modifier.fillMaxSize()) {
+        AntigravityStarfieldBackground(modifier = Modifier.fillMaxSize())
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 20.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Icon(
-                imageVector = Icons.Rounded.AutoAwesome,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.padding(14.dp)
+            AntigravityHeroEmblem()
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = "Antigravity",
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.onSurface
             )
-        }
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = "Antigravity on Android",
-            style = MaterialTheme.typography.displaySmall,
-            color = MaterialTheme.colorScheme.onSurface
-        )
-        Spacer(Modifier.height(6.dp))
-        val abiNote = if (state.detectedAbi.isNotBlank()) " (${state.detectedAbi})" else ""
-        Text(
-            text = "Powered by official agy acp$abiNote with ${state.health?.privilegeLevel ?: "standalone"} device control.",
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(20.dp))
 
-        val showSetupChecklist = state.connectionState != BridgeConnectionState.CONNECTED ||
-            state.isBootstrapping ||
-            (state.activeProfile?.isStandalone == true && (!state.standaloneSignedIn || !state.standaloneToolchainInstalled))
+            val needsConnection = state.connectionState != BridgeConnectionState.CONNECTED
+            val needsAuth = state.activeProfile?.isStandalone == true && !state.standaloneSignedIn
+            val showSetupCard = state.isBootstrapping || needsConnection || needsAuth
 
-        if (showSetupChecklist) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = M3ExpressiveShape.ExtraLarge,
-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
-                )
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+            if (showSetupCard) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = M3ExpressiveShape.ExtraLarge,
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+                    )
                 ) {
-                    Text(
-                        text = "Standalone Setup & Status",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Text(
-                        text = "Runs official agy directly inside Agy Mobile on arm64-v8a & x86_64 (gbOS86) — no Termux app required.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    if (state.isBootstrapping) {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        if (state.isBootstrapping) {
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -676,165 +683,122 @@ internal fun EmptyChatHero(
                                     trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
                                 )
                             }
-                        }
-                    } else if ((state.standaloneStatus ?: state.bootstrapStatus) != null) {
-                        Text(
-                            text = state.standaloneStatus ?: state.bootstrapStatus.orEmpty(),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    // Step 1: Standalone Engine
-                    if (state.connectionState != BridgeConnectionState.CONNECTED) {
-                        Button(
-                            onClick = { onStartStandaloneEngine(false) },
-                            enabled = !state.isBootstrapping,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.Full
-                        ) {
-                            Text(
-                                if (state.standaloneInstalled) "Start Standalone Engine"
-                                else "1. Install & Start Standalone Engine"
-                            )
-                        }
-                    } else if (state.standaloneInstalled) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "1. Engine: agy ${state.standaloneAgyVersion ?: "installed"}",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            TextButton(
-                                onClick = onUpdateStandaloneAgy,
-                                enabled = !state.isBootstrapping
+                        } else if (needsConnection) {
+                            Button(
+                                onClick = { onStartStandaloneEngine(false) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .defaultMinSize(minHeight = 48.dp),
+                                shape = M3ExpressiveShape.Full
                             ) {
-                                Text("Update")
-                            }
-                        }
-                    }
-
-                    // Step 2: Sign in with Google
-                    if (state.activeProfile?.isStandalone == true && !state.standaloneSignedIn) {
-                        Button(
-                            onClick = onOpenAuth,
-                            enabled = !state.isBootstrapping,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.Full
-                        ) {
-                            Text("2. Sign in with Google (Guided)")
-                        }
-                    }
-
-                    // Step 3: Optional Git & Node/NPM Toolchain
-                    if (!state.standaloneToolchainInstalled) {
-                        FilledTonalButton(
-                            onClick = {
-                                if (state.standaloneInstalled) onInstallToolchain()
-                                else onStartStandaloneEngine(true)
-                            },
-                            enabled = !state.isBootstrapping,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.Full
-                        ) {
-                            Text("3. Install Git & Node/NPM (Recommended)")
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        FilledTonalButton(
-                            onClick = { onAutoSetupBridge(false) },
-                            enabled = !state.isBootstrapping,
-                            modifier = Modifier
-                                .weight(1f)
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.groupLeftShape
-                        ) {
-                            Text("Termux")
-                        }
-                        FilledTonalButton(
-                            onClick = { onAutoSetupBridge(true) },
-                            enabled = !state.isBootstrapping,
-                            modifier = Modifier
-                                .weight(1f)
-                                .defaultMinSize(minHeight = 48.dp),
-                            shape = M3ExpressiveShape.groupRightShape
-                        ) {
-                            Text("Termux Root (su)")
-                        }
-                    }
-
-                    if (state.termuxInstalled) {
-                        TextButton(
-                            onClick = {
-                                val cm = context.getSystemService(ClipboardManager::class.java)
-                                cm?.setPrimaryClip(
-                                    ClipData.newPlainText(
-                                        "Termux allow-external-apps",
-                                        TermuxBridgeBootstrap.ENABLE_EXTERNAL_APPS_CMD
-                                    )
+                                Text(
+                                    if (state.standaloneInstalled) "Start local engine"
+                                    else "Set up local engine"
                                 )
-                                Toast.makeText(
-                                    context,
-                                    "Copied 1-time Termux permission command",
-                                    Toast.LENGTH_SHORT
-                                ).show()
                             }
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.ContentCopy,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(Modifier.size(6.dp))
-                            Text("Copy 1-time unrooted Termux enable command")
+                            TextButton(onClick = onOpenSettings) {
+                                Text("Connection options")
+                            }
+                        } else if (needsAuth) {
+                            Button(
+                                onClick = onOpenAuth,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .defaultMinSize(minHeight = 48.dp),
+                                shape = M3ExpressiveShape.Full
+                            ) {
+                                Text("Sign in with Google")
+                            }
                         }
                     }
                 }
+                Spacer(Modifier.height(16.dp))
             }
-            Spacer(Modifier.height(16.dp))
-        }
 
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                QuickActionCard(
+                    icon = Icons.Rounded.Build,
+                    title = "Inspect device",
+                    subtitle = "Check current screen and active app",
+                    onClick = { onQuickPrompt("Check Android status and tell me what app is in the foreground.") }
+                )
+                QuickActionCard(
+                    icon = Icons.Rounded.Description,
+                    title = "Plan a task",
+                    subtitle = "Outline steps before editing files",
+                    onClick = { onQuickPrompt("/plan ") }
+                )
+                QuickActionCard(
+                    icon = Icons.Rounded.Extension,
+                    title = "Plugins & MCP",
+                    subtitle = "Manage tools, rules, and extensions",
+                    onClick = onOpenMarketplace
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickActionCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = M3ExpressiveShape.ExtraLarge,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            AssistChip(
-                onClick = { onQuickPrompt("Check Android status and tell me what app is in the foreground.") },
-                label = { Text("Inspect Device") }
-            )
-            AssistChip(
-                onClick = { onQuickPrompt("Take a screenshot of my screen and describe it.") },
-                label = { Text("Screen Vision") }
-            )
-            AssistChip(
-                onClick = { onQuickPrompt("/plan ") },
-                label = { Text("/plan") }
-            )
-            AssistChip(
-                onClick = onOpenMarketplace,
-                label = { Text("Marketplace (/plugin)") }
-            )
-            AssistChip(
-                onClick = onOpenTerminal,
-                label = { Text("Login / Terminal") }
-            )
-            AssistChip(
-                onClick = onOpenSettings,
-                label = { Text("Bridge Setup") }
+            Surface(
+                modifier = Modifier.size(40.dp),
+                shape = M3ExpressiveShape.Medium,
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Icon(
+                imageVector = Icons.Rounded.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp)
             )
         }
     }
@@ -853,10 +817,15 @@ internal fun MessageBubbleItem(
                 horizontalArrangement = Arrangement.End
             ) {
                 Surface(
-                    shape = M3ExpressiveShape.ExtraLarge,
+                    shape = RoundedCornerShape(
+                        topStart = 22.dp,
+                        topEnd = 6.dp,
+                        bottomStart = 22.dp,
+                        bottomEnd = 22.dp
+                    ),
                     color = MaterialTheme.colorScheme.primaryContainer,
                     contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.widthIn(max = 320.dp)
+                    modifier = Modifier.widthIn(max = 312.dp)
                 ) {
                     Text(
                         text = message.text,
@@ -919,26 +888,21 @@ internal fun MessageBubbleItem(
                 }
 
                 if (message.text.isNotBlank()) {
-                    Surface(
-                        shape = M3ExpressiveShape.ExtraLarge,
-                        color = MaterialTheme.colorScheme.surfaceContainerLow
-                    ) {
-                        MarkdownText(
-                            markdown = message.text,
-                            modifier = Modifier.padding(16.dp)
-                        )
-                    }
+                    MarkdownText(
+                        markdown = message.text,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
                 }
 
                 if (message.isStreaming) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.padding(start = 6.dp)
+                        modifier = Modifier.padding(start = 4.dp)
                     ) {
                         ExpressiveLoadingIndicator()
                         Text(
-                            text = "agy is working…",
+                            text = "Working…",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -956,7 +920,7 @@ private fun ThinkingPill(thinkingText: String) {
     Surface(
         onClick = { expanded = !expanded },
         shape = M3ExpressiveShape.LargeIncreased,
-        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
     ) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
             Row(
@@ -966,19 +930,20 @@ private fun ThinkingPill(thinkingText: String) {
                 Icon(
                     imageVector = Icons.Rounded.Psychology,
                     contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    text = "Thinking",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    text = "Reasoning",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
                 Icon(
                     imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                     contentDescription = if (expanded) "Collapse" else "Expand",
-                    tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             AnimatedVisibility(
@@ -989,7 +954,7 @@ private fun ThinkingPill(thinkingText: String) {
                 Text(
                     text = thinkingText,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp)
                 )
             }
@@ -1000,11 +965,13 @@ private fun ThinkingPill(thinkingText: String) {
 @Composable
 private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
     var expanded by remember { mutableStateOf(tool.imageBase64 != null) }
+    val isDone = tool.status == "completed"
+    val iconTint = if (isDone) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
 
     Surface(
         onClick = { expanded = !expanded },
         shape = M3ExpressiveShape.LargeIncreased,
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
         border = BorderStroke(
             width = 1.dp,
             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
@@ -1013,34 +980,60 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(
-                    imageVector = if (tool.status == "completed") Icons.Rounded.CheckCircle else Icons.Rounded.Build,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = if (tool.status == "completed") MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = tool.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
                 Surface(
+                    modifier = Modifier.size(30.dp),
                     shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surfaceContainerHighest
+                    color = iconTint.copy(alpha = 0.14f)
                 ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (isDone) Icons.Rounded.CheckCircle else Icons.Rounded.Build,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = iconTint
+                        )
+                    }
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = tool.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = tool.diffPath ?: tool.status,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (tool.diffPath != null) {
+                    Surface(
+                        onClick = onOpenDiff,
+                        shape = M3ExpressiveShape.Full,
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh
+                    ) {
+                        Text(
+                            text = "View diff",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        )
+                    }
+                } else {
                     Text(
                         text = tool.status,
                         style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -1063,12 +1056,6 @@ private fun ToolCallCard(tool: ToolCallUi, onOpenDiff: () -> Unit) {
                             .heightIn(max = 260.dp)
                             .clip(M3ExpressiveShape.Large)
                     )
-                }
-            }
-
-            if (tool.diffPath != null) {
-                TextButton(onClick = onOpenDiff) {
-                    Text("Inspect diff: ${tool.diffPath}")
                 }
             }
 
@@ -1107,67 +1094,98 @@ internal fun FloatingComposerSection(
     onOpenArtifactSheet: () -> Unit,
     onOpenTerminal: () -> Unit
 ) {
+    var toolsExpanded by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Quick Expressive Floating Toolbar Pills
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        AnimatedVisibility(
+            visible = toolsExpanded,
+            enter = fadeIn() + expandVertically(M3ExpressiveMotion.adaptiveSpatialFast()),
+            exit = fadeOut() + shrinkVertically(M3ExpressiveMotion.adaptiveSpatialFast())
         ) {
-            FloatingPillToolbar {
-                TextButton(onClick = onSlashTap) {
-                    Text("/", style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace))
-                }
-                TextButton(onClick = onOpenModeSheet) {
-                    Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.size(4.dp))
-                    Text(state.activeModeLabel)
-                }
-                TextButton(onClick = onOpenDiffSheet) {
-                    Icon(Icons.Rounded.Difference, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.size(4.dp))
-                    Text("Diff (${state.diffFiles.size})")
-                }
-                if (state.artifacts.isNotEmpty()) {
-                    TextButton(onClick = onOpenArtifactSheet) {
-                        Icon(Icons.Rounded.Description, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.size(4.dp))
-                        Text("Artifact")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ComposerToolPill(
+                    label = "Commands /",
+                    onClick = {
+                        toolsExpanded = false
+                        onSlashTap()
                     }
+                )
+                ComposerToolPill(
+                    label = "Diff (${state.diffFiles.size})",
+                    icon = Icons.Rounded.Difference,
+                    onClick = {
+                        toolsExpanded = false
+                        onOpenDiffSheet()
+                    }
+                )
+                if (state.artifacts.isNotEmpty()) {
+                    ComposerToolPill(
+                        label = "Artifacts",
+                        icon = Icons.Rounded.Description,
+                        onClick = {
+                            toolsExpanded = false
+                            onOpenArtifactSheet()
+                        }
+                    )
                 }
-                TextButton(onClick = onOpenTerminal) {
-                    Icon(Icons.Rounded.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.size(4.dp))
-                    Text("Shell")
-                }
+                ComposerToolPill(
+                    label = "Terminal",
+                    icon = Icons.Rounded.Terminal,
+                    onClick = {
+                        toolsExpanded = false
+                        onOpenTerminal()
+                    }
+                )
+                ComposerToolPill(
+                    label = state.activeModeLabel,
+                    icon = Icons.Rounded.Tune,
+                    onClick = {
+                        toolsExpanded = false
+                        onOpenModeSheet()
+                    }
+                )
             }
         }
 
-        // Floating Pill Composer Input
+        // Single Unified Pill Composer
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = M3ExpressiveShape.ExtraLargeIncreased,
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            tonalElevation = 4.dp,
-            shadowElevation = 4.dp,
+            tonalElevation = 2.dp,
             border = BorderStroke(
                 width = 1.dp,
-                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
             )
         ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                IconButton(
+                    onClick = { toolsExpanded = !toolsExpanded },
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        imageVector = if (toolsExpanded) Icons.Rounded.Close else Icons.Rounded.Add,
+                        contentDescription = if (toolsExpanded) "Hide tools" else "Tools",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -1177,7 +1195,7 @@ internal fun FloatingComposerSection(
                 ) {
                     if (state.composerText.isEmpty()) {
                         Text(
-                            text = "Ask agy or type / for commands…",
+                            text = "Message Antigravity…",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1215,6 +1233,45 @@ internal fun FloatingComposerSection(
                     onStop = onStop
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun ComposerToolPill(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = M3ExpressiveShape.Full,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .defaultMinSize(minHeight = 40.dp)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (icon != null) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface
+            )
         }
     }
 }

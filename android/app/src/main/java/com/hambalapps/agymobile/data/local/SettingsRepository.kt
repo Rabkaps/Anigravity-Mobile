@@ -63,7 +63,8 @@ data class AppPreferences(
     val permissionPolicy: String = "request_review",
     val geminiApiKey: String = "",
     val projects: List<LocalProject> = emptyList(),
-    val activeProjectId: String = ""
+    val activeProjectId: String = "",
+    val themeMode: String = "system"
 ) {
     val activeProfile: ConnectionProfile
         get() = profiles.firstOrNull { it.id == activeProfileId } ?: profiles.first()
@@ -87,6 +88,7 @@ class SettingsRepository(private val context: Context) {
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
         val PROJECTS = stringPreferencesKey("local_projects_json")
         val ACTIVE_PROJECT_ID = stringPreferencesKey("active_project_id")
+        val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 
     private val standaloneDefaultCwd = "${context.filesDir.absolutePath}/engine/home"
@@ -151,7 +153,8 @@ class SettingsRepository(private val context: Context) {
             permissionPolicy = prefs[Keys.PERMISSION_POLICY] ?: "request_review",
             geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: "",
             projects = decodedProjects,
-            activeProjectId = activeProjId
+            activeProjectId = activeProjId,
+            themeMode = prefs[Keys.THEME_MODE] ?: "system"
         )
     }
 
@@ -196,6 +199,10 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setDynamicColor(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.DYNAMIC_COLOR] = enabled }
+    }
+
+    suspend fun setThemeMode(mode: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.THEME_MODE] = mode }
     }
 
     suspend fun setSelectedModel(model: String) {

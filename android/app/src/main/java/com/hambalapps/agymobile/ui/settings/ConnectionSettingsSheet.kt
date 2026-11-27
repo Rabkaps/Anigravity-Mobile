@@ -36,6 +36,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import com.hambalapps.agymobile.data.local.AppPreferences
 import com.hambalapps.agymobile.data.local.ConnectionProfile
+import com.hambalapps.agymobile.ui.components.ConnectedButtonGroup
 import com.hambalapps.agymobile.ui.components.ExpressiveLoadingIndicator
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveShape
 import java.util.UUID
@@ -61,6 +62,7 @@ fun ConnectionSettingsSheet(
     onTestConnection: (ConnectionProfile) -> Unit,
     onToggleAmoled: (Boolean) -> Unit,
     onToggleDynamicColor: (Boolean) -> Unit,
+    onSelectThemeMode: (String) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val active = preferences?.activeProfile
@@ -224,7 +226,24 @@ fun ConnectionSettingsSheet(
                 shape = M3ExpressiveShape.Large,
                 color = MaterialTheme.colorScheme.surfaceContainerLow
             ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    val modeKeys = listOf("system", "light", "dark", "solar")
+                    val modeLabels = listOf("System", "Light", "Dark", "Dynamic")
+                    val currentMode = preferences?.themeMode ?: "system"
+                    Text("Appearance", style = MaterialTheme.typography.titleMedium)
+                    ConnectedButtonGroup(
+                        options = modeLabels,
+                        selectedIndex = modeKeys.indexOf(currentMode).coerceAtLeast(0),
+                        onSelect = { idx -> onSelectThemeMode(modeKeys[idx]) }
+                    )
+                    if (currentMode == "solar") {
+                        Text(
+                            text = "Adapts colors from warm morning light to deep night using your location.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    HorizontalDivider()
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,

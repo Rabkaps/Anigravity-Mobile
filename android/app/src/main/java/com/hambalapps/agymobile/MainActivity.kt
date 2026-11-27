@@ -21,12 +21,21 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hambalapps.agymobile.data.termux.TermuxBridgeBootstrap
 import com.hambalapps.agymobile.ui.chat.ChatScreen
 import com.hambalapps.agymobile.ui.chat.ChatViewModel
 import com.hambalapps.agymobile.ui.theme.AgyExpressiveTheme
+import com.hambalapps.agymobile.ui.theme.AppThemeMode
+import com.hambalapps.agymobile.ui.theme.getLastKnownCoarseLocation
+import kotlinx.coroutines.delay
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -37,6 +46,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             val chatViewModel: ChatViewModel = viewModel()
             val state by chatViewModel.uiState.collectAsState()
+            val themeMode = AppThemeMode.fromKey(state.preferences?.themeMode)
+            var solarLocation by remember { mutableStateOf<Pair<Double, Double>?>(null) }
+            var askedLocationOnce by remember { mutableStateOf(false) }
+            var solarEpochMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+            val locationPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (granted) {
+                    solarLocation = getLastKnownCoarseLocation(this)
+                }
+            }
 
             val speechLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.StartActivityForResult()
@@ -129,10 +150,41 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            LaunchedEffect(themeMode) {
+                if (themeMode == AppThemeMode.SOLAR) {
+                    val hasCoarse = ContextCompat.checkSelfPermission(
+                        this@MainActivity,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (hasCoarse) {
+                        solarLocation = getLastKnownCoarseLocation(this@MainActivity)
+                    } else if (!askedLocationOnce) {
+                        askedLocationOnce = true
+                        locationPermissionLauncher.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                    }
+                    lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                        while (true) {
+                            solarEpochMillis = System.currentTimeMillis()
+                            if (ContextCompat.checkSelfPermission(
+                                    this@MainActivity,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                ) == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                solarLocation = getLastKnownCoarseLocation(this@MainActivity) ?: solarLocation
+                            }
+                            delay(60_000L)
+                        }
+                    }
+                }
+            }
+
             AgyExpressiveTheme(
                 darkTheme = isSystemInDarkTheme(),
                 dynamicColor = state.preferences?.dynamicColor ?: true,
-                amoledDark = state.preferences?.amoledDark ?: false
+                amoledDark = state.preferences?.amoledDark ?: false,
+                themeMode = themeMode,
+                solarLocation = solarLocation,
+                solarEpochMillis = solarEpochMillis
             ) {
                 ChatScreen(
                     state = state,

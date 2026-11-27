@@ -1379,6 +1379,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { settingsRepo.setDynamicColor(enabled) }
     }
 
+    fun setThemeMode(mode: String) {
+        viewModelScope.launch { settingsRepo.setThemeMode(mode) }
+    }
+
     fun testConnection(profile: ConnectionProfile) {
         if (profile.isStandalone) {
             val arch = engineManager.detectArch()

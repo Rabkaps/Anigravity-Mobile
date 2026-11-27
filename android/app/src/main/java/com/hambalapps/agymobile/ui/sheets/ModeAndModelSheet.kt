@@ -1,7 +1,10 @@
 package com.hambalapps.agymobile.ui.sheets
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -26,6 +30,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -38,6 +43,7 @@ import com.hambalapps.agymobile.data.acp.AcpConfigOption
 import com.hambalapps.agymobile.data.acp.ModelQuotaInfo
 import com.hambalapps.agymobile.data.acp.QuotaBucketInfo
 import com.hambalapps.agymobile.data.acp.QuotaSummaryResponse
+import com.hambalapps.agymobile.ui.components.BridgeConnectionState
 import com.hambalapps.agymobile.ui.components.ConnectedButtonGroup
 import com.hambalapps.agymobile.ui.components.ExpressiveLoadingIndicator
 import com.hambalapps.agymobile.ui.theme.M3ExpressiveMotion
@@ -62,7 +68,57 @@ fun ModeAndModelSheet(
     onOpenAuth: () -> Unit,
     onDismiss: () -> Unit,
     isSignedIn: Boolean = false,
-    onLogout: () -> Unit = {}
+    onLogout: () -> Unit = {},
+    connectionState: BridgeConnectionState = BridgeConnectionState.DISCONNECTED,
+    profileName: String = "Local",
+    onOpenSettings: () -> Unit = {}
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        shape = M3ExpressiveShape.ExtraLarge,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        ModeAndModelSheetContent(
+            configOptions = configOptions,
+            usedTokens = usedTokens,
+            maxTokens = maxTokens,
+            quotaSummary = quotaSummary,
+            isLoadingQuota = isLoadingQuota,
+            quotaLookup = quotaLookup,
+            onRefreshQuota = onRefreshQuota,
+            permissionPolicy = permissionPolicy,
+            onSelectPermissionPolicy = onSelectPermissionPolicy,
+            onSetConfigOption = onSetConfigOption,
+            onOpenAuth = onOpenAuth,
+            onDismiss = onDismiss,
+            isSignedIn = isSignedIn,
+            onLogout = onLogout,
+            connectionState = connectionState,
+            profileName = profileName,
+            onOpenSettings = onOpenSettings
+        )
+    }
+}
+
+@Composable
+internal fun ModeAndModelSheetContent(
+    configOptions: List<AcpConfigOption>,
+    usedTokens: Int,
+    maxTokens: Int,
+    quotaSummary: QuotaSummaryResponse? = null,
+    isLoadingQuota: Boolean = false,
+    quotaLookup: (value: String, name: String) -> ModelQuotaInfo? = { _, _ -> null },
+    onRefreshQuota: () -> Unit = {},
+    permissionPolicy: String = "request_review",
+    onSelectPermissionPolicy: (String) -> Unit = {},
+    onSetConfigOption: (configId: String, value: String) -> Unit,
+    onOpenAuth: () -> Unit,
+    onDismiss: () -> Unit,
+    isSignedIn: Boolean = false,
+    onLogout: () -> Unit = {},
+    connectionState: BridgeConnectionState = BridgeConnectionState.DISCONNECTED,
+    profileName: String = "Local",
+    onOpenSettings: () -> Unit = {}
 ) {
     val contextRatio = if (maxTokens > 0) (usedTokens.toFloat() / maxTokens).coerceIn(0f, 1f) else 0f
     val animatedContext by animateFloatAsState(
@@ -70,28 +126,41 @@ fun ModeAndModelSheet(
         animationSpec = M3ExpressiveMotion.adaptiveEffectsFast(),
         label = "contextRatio"
     )
+    val statusDotColor = when (connectionState) {
+        BridgeConnectionState.CONNECTED -> MaterialTheme.colorScheme.tertiary
+        BridgeConnectionState.CONNECTING -> MaterialTheme.colorScheme.primary
+        BridgeConnectionState.ERROR -> MaterialTheme.colorScheme.error
+        BridgeConnectionState.DISCONNECTED -> MaterialTheme.colorScheme.outline
+    }
+    val statusLabel = when (connectionState) {
+        BridgeConnectionState.CONNECTED -> "Connected"
+        BridgeConnectionState.CONNECTING -> "Connecting…"
+        BridgeConnectionState.ERROR -> "Connection error"
+        BridgeConnectionState.DISCONNECTED -> "Disconnected"
+    }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        shape = M3ExpressiveShape.ExtraLarge,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
-        ) {
+        Text(
+            text = "Model & Mode",
+            style = MaterialTheme.typography.titleLarge
+        )
+
+        // Section 1: Permission Mode
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
-                text = "Session Options, Model & Quota",
-                style = MaterialTheme.typography.titleLarge
+                text = "PERMISSION MODE",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-
-            // Context Window Meter (/context)
             Surface(
-                shape = M3ExpressiveShape.Large,
+                shape = M3ExpressiveShape.LargeIncreased,
                 color = MaterialTheme.colorScheme.surfaceContainerLow
             ) {
                 Column(
@@ -100,39 +169,6 @@ fun ModeAndModelSheet(
                         .padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("Context Window", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            text = "${(contextRatio * 100).roundToInt()}% (${usedTokens / 1000}k / ${maxTokens / 1000}k)",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    LinearProgressIndicator(
-                        progress = { animatedContext },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(CircleShape),
-                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
-                    )
-                }
-            }
-
-            // Tool Permission Mode (Request Review / Auto / Turbo)
-            Surface(
-                shape = M3ExpressiveShape.Large,
-                color = MaterialTheme.colorScheme.surfaceContainerLow
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text("Tool Permission Mode", style = MaterialTheme.typography.titleMedium)
                     val policyKeys = listOf("request_review", "auto", "turbo")
                     val policyLabels = listOf("Review", "Auto", "Turbo")
                     ConnectedButtonGroup(
@@ -142,27 +178,51 @@ fun ModeAndModelSheet(
                     )
                     Text(
                         text = when (permissionPolicy) {
-                            "turbo" -> "Turbo: auto-approves all tool & command requests."
-                            "auto" -> "Auto: auto-approves read/search tools; prompts before commands or edits."
-                            else -> "Request Review: prompts before every tool or command."
+                            "turbo" -> "Auto-approves all tool and command requests."
+                            "auto" -> "Auto-approves reads; asks before commands or edits."
+                            else -> "Asks before every tool or command."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
+        }
 
-            // Models & Quota Summary Card
-            QuotaSummaryCard(
-                quotaSummary = quotaSummary,
-                isLoading = isLoadingQuota,
-                onRefresh = onRefreshQuota
-            )
+        // Section 2: Model & Session Options
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "MODEL & OPTIONS",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (isLoadingQuota) {
+                    ExpressiveLoadingIndicator(modifier = Modifier.size(20.dp))
+                } else {
+                    IconButton(onClick = onRefreshQuota, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            imageVector = Icons.Rounded.Refresh,
+                            contentDescription = "Refresh quota",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
 
             if (configOptions.isEmpty()) {
+                QuotaSummaryCard(
+                    quotaSummary = quotaSummary,
+                    isLoading = isLoadingQuota,
+                    onRefresh = onRefreshQuota
+                )
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = M3ExpressiveShape.Large,
+                    shape = M3ExpressiveShape.LargeIncreased,
                     color = MaterialTheme.colorScheme.surfaceContainerLow
                 ) {
                     Column(
@@ -170,11 +230,11 @@ fun ModeAndModelSheet(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = "No live session options loaded yet",
+                            text = "No session options loaded",
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = "Models, execution modes, and thinking levels are populated directly from your authenticated agy acp session.",
+                            text = "Connect or sign in to choose models and execution options.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -185,7 +245,7 @@ fun ModeAndModelSheet(
                                 .defaultMinSize(minHeight = 48.dp),
                             shape = M3ExpressiveShape.Full
                         ) {
-                            Text("Sign in / Check Auth")
+                            Text("Sign in / Account")
                         }
                     }
                 }
@@ -198,27 +258,102 @@ fun ModeAndModelSheet(
                     )
                 }
             }
+        }
 
-            if (isSignedIn) {
-                OutlinedButton(
-                    onClick = {
-                        onDismiss()
-                        onLogout()
-                    },
+        // Section 3: Context & Connection
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                text = "CONTEXT & CONNECTION",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Surface(
+                shape = M3ExpressiveShape.LargeIncreased,
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                )
+            ) {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp),
-                    shape = M3ExpressiveShape.Full
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Rounded.Logout,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(18.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Context window", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = "${(contextRatio * 100).roundToInt()}% (${usedTokens / 1000}k / ${maxTokens / 1000}k)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { animatedContext },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(5.dp)
+                            .clip(CircleShape),
+                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
                     )
-                    Spacer(Modifier.size(8.dp))
-                    Text("Log Out (/logout)", color = MaterialTheme.colorScheme.error)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(statusDotColor)
+                            )
+                            Text(
+                                text = "$profileName · $statusLabel",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                onDismiss()
+                                onOpenSettings()
+                            }
+                        ) {
+                            Text("Settings")
+                        }
+                    }
                 }
+            }
+        }
+
+        if (isSignedIn) {
+            OutlinedButton(
+                onClick = {
+                    onDismiss()
+                    onLogout()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 48.dp),
+                shape = M3ExpressiveShape.Full
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Rounded.Logout,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.size(8.dp))
+                Text("Sign out", color = MaterialTheme.colorScheme.error)
             }
         }
     }
